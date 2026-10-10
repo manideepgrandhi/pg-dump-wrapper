@@ -1,3 +1,29 @@
+# pg-dump-wrapper: a small PostgreSQL toolkit in Bash
+
+Cron-friendly Bash wrappers around the PostgreSQL client tools. They add safe defaults, validation, logging, documented exit codes and e-mail/webhook alerts. All tools share the same conventions, so once you know one, you know them all.
+
+## Tools
+
+| Tool | Version | What it does | Docs |
+|---|---|---|---|
+| [`pg_dump_wrapper.sh`](pg_dump_wrapper.sh) | 2.0.0 | Backups with `pg_dump`: every format, one/many/all databases, verification, sha256 checksums, retention, alerts | [README](#pg_dump_wrappersh) (below) · [Examples](EXAMPLES.md) · [Why this wrapper](WHY_THIS_WRAPPER.md) · [Sample config](pg_dump_wrapper.conf.example) |
+| [`psql_wrapper.sh`](psql_wrapper.sh) | 1.0.0 | One tool, three commands: `migrate` (transactional, tracked SQL migrations with a production guard), `query` (CSV/TSV/JSON/NDJSON exports and scheduled reports), `health` (sizes, connections, locks, long queries, bloat, replication, cache, vacuum, wraparound with WARN/CRIT thresholds) | [README](README_psql.md) · [Examples](EXAMPLES_psql.md) · [Why this wrapper](WHY_PSQL_WRAPPER.md) · [Sample config](psql_wrapper.conf.example) |
+
+A matching `pg_restore` wrapper is planned and not in this repository yet. Until then, restore with the `pg_restore` / `psql` commands shown in [EXAMPLES.md](EXAMPLES.md).
+
+## Shared conventions
+
+- **Bash 4.4+**, plus the PostgreSQL client binaries (`--pg-bin DIR` to choose a version, e.g. `/usr/lib/postgresql/17/bin`).
+- **Settings precedence:** built-in defaults → `--config FILE` (plain `key=value`, parsed, never executed, unknown keys rejected) → command line.
+- **Connection:** `-h/--host`, `-p/--port` (default `$PGPORT`, otherwise 5432; config `port=`), `-U/--user`. **Passwords are never accepted on the command line or in config files.** Use `~/.pgpass`, `--pgpassfile`/`PGPASSFILE`, `PGPASSWORD`, or a `-W` prompt. Every call uses `--no-password`, so cron jobs fail fast instead of hanging.
+- **Many databases:** `-d a,b,c` or `--all --exclude-db 'glob'`. Each database is isolated, the run ends with a summary table, and the exit code is the highest code of any database.
+- **Dry run:** `--dry-run` prints exactly what would run and changes nothing.
+- **Alerts:** `--alert-email`, `--alert-webhook` (Slack/Teams/Google Chat or structured JSON), `--alert-on`, `--alert-test`. Webhook tokens are never logged, and alerts never change the exit code.
+- **Logging:** timestamped lines tagged with the database name, plus the client tool's own output.
+- **Exit codes:** documented in each tool's README. `0` always means success.
+
+---
+
 # pg_dump_wrapper.sh
 
 A Bash wrapper around PostgreSQL `pg_dump` that adds safe defaults, validation, logging,

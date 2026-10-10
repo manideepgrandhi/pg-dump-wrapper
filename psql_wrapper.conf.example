@@ -1,0 +1,78 @@
+# psql_wrapper.conf - key=value, '#' comments, quotes optional.
+# Command-line options always override these values. List keys take comma-separated values.
+# Passwords are NOT allowed here: use ~/.pgpass or pgpassfile=
+# --yes / --confirm are deliberately NOT allowed here: confirm production writes on the command line.
+# If you put webhook URLs here, chmod 600 this file (they contain secret tokens).
+
+host=db01.internal
+port=5432
+user=app_admin
+# pgpassfile=/etc/pg_tools/.pgpass
+# maintenance_db=postgres           # used for server-wide checks and --all
+
+# --- databases ---------------------------------------------------------------
+dbnames=salesdb
+# all=yes
+# exclude_db=postgres,test_*
+# stop_on_error=no
+
+# --- production guard (migrate, and query --read-write) -------------------------
+production_dbs=salesdb,hrdb,*_prod
+# production_hosts=db01.internal,*.prod.example.com
+
+# --- psql variables (-v), comma-separated NAME=VALUE ---------------------------
+# set=app_schema=sales,region=EMEA
+
+# --- migrate -----------------------------------------------------------------
+# migrations_dir=/opt/app/migrations
+transaction=all                     # all | per-file | none
+track=yes
+track_table=public.schema_migrations
+# allow_changed=no
+
+# --- query -------------------------------------------------------------------
+# format=csv                        # csv | tsv | json | ndjson | txt
+# header=yes
+# delimiter=;
+# output_dir=/srv/reports
+# name=daily_sales
+# compress=gzip                     # none | gzip | zstd
+# retention_days=30
+# read_write=no
+# timeout=300
+
+# --- health ------------------------------------------------------------------
+# checks=connections,long_running,blocking,replication,db_size,cache_hit,bloat,vacuum,wraparound
+warn_connections=80
+crit_connections=95
+warn_long_running=300
+crit_long_running=900
+warn_blocking=30
+crit_blocking=120
+warn_replication=60
+crit_replication=300
+# warn_db_size=50000                # MB, 0 = off
+# crit_db_size=80000
+warn_cache_hit=95                   # alert when the hit ratio falls BELOW these
+crit_cache_hit=90
+warn_bloat=20
+crit_bloat=50
+warn_vacuum=7                       # days
+crit_vacuum=30
+# warn_wraparound=1000000000
+# crit_wraparound=1500000000
+min_rows=1000
+top=5
+# nagios=no
+
+# --- logging / binaries --------------------------------------------------------
+# log_file=/var/log/psql_wrapper.log
+# pg_bin=/usr/lib/postgresql/17/bin
+# verbose=no
+
+# --- alerts ------------------------------------------------------------------
+alert_on=failure                    # failure (incl. health WARN/CRIT) | crit | always
+alert_email=dba@example.com
+# alert_from=pg-tools@example.com
+# alert_webhook=https://hooks.slack.com/services/T000/B000/XXXXXXXX
+alert_webhook_format=slack          # slack | json
