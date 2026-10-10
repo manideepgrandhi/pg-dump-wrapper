@@ -10,6 +10,8 @@ pg_dump_wrapper.sh (-d DB[,DB...] | --all) [options] [-- extra pg_dump args]
 
 Version 2.0.0. Needs Bash 4.4 or newer.
 
+📘 **For copy-paste recipes for every scenario (formats, filters, migration, multiple databases, alerts, cron/systemd, exit codes, errors, restores), see [EXAMPLES.md](EXAMPLES.md).**
+
 Settings are applied in this order (later ones win): **built-in defaults → `--config` file → command line**.
 
 ## Options
