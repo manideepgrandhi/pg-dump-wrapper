@@ -2,23 +2,33 @@
 # Command-line options always override these values.
 # List keys take comma-separated values.
 # Passwords are NOT allowed here: use ~/.pgpass or pgpassfile=
+# If you put webhook URLs here, chmod 600 this file (they contain secret tokens).
 
 host=db01.internal
 port=5432
 user=backup_user
-dbname=salesdb
 # pgpassfile=/etc/pg_backup/.pgpass
 
+# --- which databases -------------------------------------------------------
+# Either a list ...
+dbnames=salesdb,hrdb
+# ... or every connectable, non-template database:
+# all=yes
+# exclude_db=postgres,test_*        # globs, only used with all=yes
+# maintenance_db=postgres           # where the database list is read from
+stop_on_error=no                    # yes = stop at the first failed database
+
+# --- format ------------------------------------------------------------------
 format=directory          # plain | custom | directory | tar
 jobs=4                    # >1 only valid for directory format
 compress=6                # 0-9 or gzip:N / zstd:N / lz4 (pg_dump 16+)
 
+# --- scope -------------------------------------------------------------------
 # schemas=sales,hr
 exclude_schemas=tmp
 # tables=sales.orders
 # exclude_tables=public.scratch_*
 exclude_table_data=audit.event_log,public.*_log
-
 no_owner=yes
 no_privileges=no
 # schema_only=no
@@ -27,7 +37,8 @@ no_privileges=no
 # if_exists=no
 # create=no
 
-output_dir=/backups/postgres/salesdb
+# --- files -------------------------------------------------------------------
+output_dir=/backups/postgres
 # log_file=/var/log/pg_dump_wrapper.log
 retention_days=14
 min_free_mb=5120
@@ -35,3 +46,10 @@ verify=yes
 checksum=yes
 # verbose=no
 # pg_bin=/usr/lib/postgresql/17/bin
+
+# --- alerts ------------------------------------------------------------------
+alert_on=failure                    # failure | always
+alert_email=dba@example.com,oncall@example.com
+# alert_from=pg-backups@example.com
+# alert_webhook=https://hooks.slack.com/services/T000/B000/XXXXXXXX
+alert_webhook_format=slack          # slack ({"text": ...}) | json (structured)
