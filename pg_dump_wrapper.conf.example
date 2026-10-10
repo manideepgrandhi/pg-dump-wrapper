@@ -1,0 +1,37 @@
+# pg_dump_wrapper.conf - key=value, '#' comments, quotes optional.
+# Command-line options always override these values.
+# List keys take comma-separated values.
+# Passwords are NOT allowed here: use ~/.pgpass or pgpassfile=
+
+host=db01.internal
+port=5432
+user=backup_user
+dbname=salesdb
+# pgpassfile=/etc/pg_backup/.pgpass
+
+format=directory          # plain | custom | directory | tar
+jobs=4                    # >1 only valid for directory format
+compress=6                # 0-9 or gzip:N / zstd:N / lz4 (pg_dump 16+)
+
+# schemas=sales,hr
+exclude_schemas=tmp
+# tables=sales.orders
+# exclude_tables=public.scratch_*
+exclude_table_data=audit.event_log,public.*_log
+
+no_owner=yes
+no_privileges=no
+# schema_only=no
+# data_only=no
+# clean=no
+# if_exists=no
+# create=no
+
+output_dir=/backups/postgres/salesdb
+# log_file=/var/log/pg_dump_wrapper.log
+retention_days=14
+min_free_mb=5120
+verify=yes
+checksum=yes
+# verbose=no
+# pg_bin=/usr/lib/postgresql/17/bin
