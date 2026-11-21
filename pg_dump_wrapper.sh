@@ -18,13 +18,32 @@
 #   130  interrupted (INT/TERM)
 #
 # Passwords are NEVER accepted on the command line. Use ~/.pgpass, PGPASSFILE
-# (or the pgpassfile= config key), the PGPASSWORD environment variable, or -W to prompt.
+# (or the pgpassfile= config key), the PGPASSWORD environment variable, or -W to prompt
+# once at the start (the answer is kept in memory for this run only).
+#
+# Runs on Linux and on Windows under Git Bash / MSYS2 / Cygwin (with the native
+# Windows PostgreSQL client tools): CRLF output from psql.exe etc. is handled and
+# Windows paths (C:\backups, C:/backups, /c/backups) are accepted.
 
 set -Eeuo pipefail
 umask 077
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.0.1"
+
+# ----------------------------------------------------------------------------
+# Platform (Windows = Git Bash / MSYS2 / Cygwin; everything else behaves as Linux)
+# ----------------------------------------------------------------------------
+readonly CR=$'\r'                                 # Windows tools end lines with CR LF
+readonly WINDOWS_UNAME_RE='^(MINGW|MSYS|CYGWIN)'   # `uname -s` prefixes of Windows bash ports
+readonly WINDOWS_EXE_SUFFIX=".exe"
+readonly CHECKSUM_BITS=256                         # SHA-256 (sha256sum, or shasum -a 256)
+readonly TTY_DEVICE="/dev/tty"                     # where -W reads the password from
+IS_WINDOWS=0
+_uname="$(uname -s 2>/dev/null || true)"
+[[ "${_uname//$CR/}" =~ $WINDOWS_UNAME_RE ]] && IS_WINDOWS=1
+readonly IS_WINDOWS
+unset _uname
 
 # ----------------------------------------------------------------------------
 # Defaults (lowest precedence: defaults < config file < command line)
@@ -133,7 +152,8 @@ Connection:
   -h, --host HOST              Server host or socket dir          (default: \$PGHOST or localhost)
   -p, --port PORT              Server port                        (default: \$PGPORT or 5432)
   -U, --user USER              Database user                      (default: \$PGUSER or \$USER)
-  -W, --password               Prompt for password (interactive only; default never prompts)
+  -W, --password               Prompt once for the password at the start (needs a terminal);
+                               it is used for every database and never stored or logged
       --pgpassfile FILE        Use this .pgpass file (sets PGPASSFILE)
 
 Databases (each database gets its own dump file):
@@ -216,8 +236,93 @@ is_true() {
     case "${1,,}" in 1|y|yes|true|on) return 0 ;; *) return 1 ;; esac
 }
 
-bin() {  # resolve a postgres binary, honouring --pg-bin
-    if [[ -n "$PG_BIN" ]]; then printf '%s/%s' "${PG_BIN%/}" "$1"; else printf '%s' "$1"; fi
+bin() {  # resolve a postgres binary, honouring --pg-bin (and NAME.exe on Windows)
+    local p="$1"
+    [[ -n "$PG_BIN" ]] && p="${PG_BIN%/}/$1"
+    if (( IS_WINDOWS )) && [[ "$p" == */* && ! -e "$p" && -e "$p$WINDOWS_EXE_SUFFIX" ]]; then
+        p+="$WINDOWS_EXE_SUFFIX"
+    fi
+    printf '%s' "$p"
+}
+
+# Remove every CR from the variable named by $1. Native Windows tools (psql.exe,
+# pg_dump.exe, ...) print CRLF line endings; without this a database "abc" is read
+# as "abc<CR>" and numbers stop being numbers. No-op for Linux output.
+strip_cr() {
+    local -n _sc_ref="$1"
+    _sc_ref="${_sc_ref//$CR/}"
+}
+
+# Windows only: C:\dir, C:/dir and c:dir -> /c/dir (cygpath when present).
+# Unix-style paths, and every path on Linux, are returned unchanged.
+to_unix_path() {
+    local p="$1"
+    if (( !IS_WINDOWS )) || [[ "$p" != *\\* && ! "$p" =~ ^[A-Za-z]: ]]; then
+        printf '%s' "$p"; return 0
+    fi
+    if [[ "$p" =~ ^[A-Za-z]:([^/\\]|$) ]]; then
+        log_warn "Path '$p' has no '\\' or '/' after the drive letter: bash drops backslashes from unquoted paths." \
+            "Quote Windows paths ('C:\\backups') or use forward slashes (C:/backups)."
+    fi
+    [[ "$p" == -* ]] && p="./$p"
+    if command -v cygpath >/dev/null 2>&1; then
+        p="$(cygpath -u "$p")"; strip_cr p
+    else
+        p="${p//\\//}"
+        [[ "$p" =~ ^([A-Za-z]):/?(.*)$ ]] && p="/${BASH_REMATCH[1],,}/${BASH_REMATCH[2]}"
+    fi
+    printf '%s' "$p"
+}
+
+# Path handed to a native Windows program (pg_dump.exe --file, PGPASSFILE, ...):
+# /c/dir -> C:/dir. Unchanged on Linux.
+native_path() {
+    local p="$1"
+    (( IS_WINDOWS )) || { printf '%s' "$p"; return 0; }
+    [[ "$p" == -* ]] && p="./$p"
+    if command -v cygpath >/dev/null 2>&1; then
+        p="$(cygpath -m "$p")"; strip_cr p
+    elif [[ "$p" =~ ^/([A-Za-z])(/.*)?$ ]]; then
+        p="${BASH_REMATCH[1]^^}:${BASH_REMATCH[2]:-/}"
+    fi
+    printf '%s' "$p"
+}
+
+normalize_paths() {   # Windows: accept C:\x, C:/x and /c/x for every path option
+    (( IS_WINDOWS )) || return 0
+    OUTPUT_DIR="$(to_unix_path "$OUTPUT_DIR")"
+    LOG_FILE="$(to_unix_path "$LOG_FILE")"
+    PG_BIN="$(to_unix_path "$PG_BIN")"
+    PGPASSFILE_OPT="$(to_unix_path "$PGPASSFILE_OPT")"
+    [[ -n "${TMPDIR:-}" ]] && TMPDIR="$(to_unix_path "$TMPDIR")"
+    log_debug "Windows paths: output_dir=$OUTPUT_DIR log_file=${LOG_FILE:-<default>} pg_bin=${PG_BIN:-<PATH>} pgpassfile=${PGPASSFILE_OPT:-<none>}"
+    return 0
+}
+
+free_kb_of() {   # free_kb_of <dir> -> available KB ('' if unknown)
+    local out
+    out="$(df -Pk -- "$1" 2>/dev/null)" || true
+    strip_cr out
+    # Read the column before "NN%" so spaces in the filesystem name
+    # (e.g. "C:/Program Files/Git" on Windows) cannot shift the columns.
+    awk 'NR==2 { for (i = NF; i > 1; i--) if ($i ~ /^[0-9]+%$/) { print $(i-1); exit } }' <<<"$out"
+}
+
+host_name() {
+    local h
+    h="$(hostname 2>/dev/null)" || h=""
+    strip_cr h
+    printf '%s' "${h:-unknown}"
+}
+
+sha256_files() {   # sha256_files FILE... -> "<hash>  <file>" lines
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum -- "$@"
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a "$CHECKSUM_BITS" -- "$@"
+    else
+        log_error "Neither sha256sum nor shasum is installed"; return 1
+    fi
 }
 
 need_arg() {  # need_arg <option> <remaining-arg-count>
@@ -253,7 +358,8 @@ fmt_duration() {
 # List keys accept comma-separated values.
 # ----------------------------------------------------------------------------
 load_config() {
-    local file="$1" line key val lineno=0
+    local file line key val lineno=0
+    file="$(to_unix_path "$1")"
     [[ -r "$file" ]] || die 1 "Config file not readable: $file"
     while IFS= read -r line || [[ -n "$line" ]]; do
         lineno=$((lineno + 1))
@@ -473,11 +579,39 @@ validate() {
     [[ "$MIN_FREE_MB" =~ ^[0-9]+$ ]] || die 1 "--min-free-mb must be an integer"
 
     [[ -z "$FILE_NAME" || "$FILE_NAME" != */* ]] || die 1 "--file must be a bare file name; use --output-dir for the directory"
+    if (( IS_WINDOWS )) && [[ "$FILE_NAME" == *\\* ]]; then
+        die 1 "--file must be a bare file name; use --output-dir for the directory"
+    fi
 
     if [[ -n "$PGPASSFILE_OPT" ]]; then
         [[ -r "$PGPASSFILE_OPT" ]] || die 1 "pgpassfile not readable: $PGPASSFILE_OPT"
-        export PGPASSFILE="$PGPASSFILE_OPT"
+        PGPASSFILE="$(native_path "$PGPASSFILE_OPT")"
+        export PGPASSFILE
     fi
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# -W: ask once, here, instead of letting each tool prompt. Native Windows tools
+# cannot prompt in Git Bash/mintty, and pg_dump runs in the background anyway.
+# The password is exported as PGPASSWORD for this process and its children only.
+# ----------------------------------------------------------------------------
+prompt_password() {
+    (( PROMPT_PASSWORD )) || return 0
+    local ttyfd pw=""
+    if ! { exec {ttyfd}<>"$TTY_DEVICE"; } 2>/dev/null; then
+        die 1 "-W needs a terminal to type the password, but none is available (cron/Task Scheduler?)." \
+            "Use ~/.pgpass (%APPDATA%\\postgresql\\pgpass.conf on Windows) or --pgpassfile instead."
+    fi
+    printf 'Password for user %s@%s:%s: ' "$DB_USER" "$DB_HOST" "$DB_PORT" >&"$ttyfd"
+    IFS= read -r -s -u "$ttyfd" pw || true
+    printf '\n' >&"$ttyfd"
+    exec {ttyfd}>&-
+    pw="${pw%"$CR"}"
+    [[ -n "$pw" ]] || die 1 "No password entered (-W). Run again and type the password, or use ~/.pgpass / --pgpassfile."
+    export PGPASSWORD="$pw"
+    pw=""
+    log_debug "Password read from the terminal (-W); it will be used for every connection in this run"
     return 0
 }
 
@@ -490,8 +624,10 @@ resolve_databases() {
     local out db pat skip
     if ! out="$("$(bin psql)" -X -w -At -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$MAINTENANCE_DB" \
             -c "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname" 2>&1)"; then
+        strip_cr out
         die 2 "Cannot list databases via '$MAINTENANCE_DB': ${out//$'\n'/ }"
     fi
+    strip_cr out
     DB_NAMES=()
     while IFS= read -r db; do
         [[ -n "$db" ]] || continue
@@ -556,8 +692,8 @@ build_command() {
     local x
     CMD=("$(bin pg_dump)"
          --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME"
-         --format="$FORMAT" --file="$OUTPUT_PATH")
-    if (( PROMPT_PASSWORD )); then CMD+=(--password); else CMD+=(--no-password); fi
+         --format="$FORMAT" --file="$(native_path "$OUTPUT_PATH")")
+    CMD+=(--no-password)   # never let pg_dump prompt; -W is answered once by prompt_password
     [[ -n "$COMPRESS" ]] && CMD+=(--compress="$COMPRESS")
     (( JOBS > 1 )) && CMD+=(--jobs="$JOBS")
     (( SCHEMA_ONLY )) && CMD+=(--schema-only)
@@ -589,7 +725,8 @@ print_command() {
 global_prechecks() {   # once per run
     local pgd; pgd="$(bin pg_dump)"
     command -v "$pgd" >/dev/null 2>&1 || die 2 "pg_dump not found (install postgresql-client or use --pg-bin)"
-    log_info "Using $("$pgd" --version) ($(command -v "$pgd"))"
+    local ver; ver="$("$pgd" --version)"; strip_cr ver
+    log_info "Using $ver ($(command -v "$pgd"))"
 
     (( SKIP_PRECHECK )) && { log_warn "Skipping connectivity and disk-space checks"; return 0; }
 
@@ -600,7 +737,7 @@ global_prechecks() {   # once per run
     fi
 
     local free_kb free_mb
-    free_kb="$(df -Pk "$OUTPUT_DIR" | awk 'NR==2 {print $4}')"
+    free_kb="$(free_kb_of "$OUTPUT_DIR")"
     if [[ "$free_kb" =~ ^[0-9]+$ ]]; then
         free_mb=$(( free_kb / 1024 ))
         log_info "Free space in $OUTPUT_DIR: ${free_mb} MB"
@@ -612,20 +749,21 @@ global_prechecks() {   # once per run
 db_prechecks() {       # once per database (runs in the per-db child)
     (( SKIP_PRECHECK )) && return 0
     command -v "$(bin psql)" >/dev/null 2>&1 || return 0
-    (( PROMPT_PASSWORD )) && return 0
     local out server_ver db_size_bytes client_major server_major free_kb
     if ! out="$("$(bin psql)" -X -w -At -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
             -c "SELECT current_setting('server_version_num') || '|' || pg_database_size(current_database())" 2>&1)"; then
+        strip_cr out
         die 2 "Cannot connect to database '$DB_NAME' as '$DB_USER': ${out//$'\n'/ }"
     fi
+    strip_cr out
     server_ver="${out%%|*}"; db_size_bytes="${out##*|}"
     log_info "Connected: server_version_num=$server_ver, database size=$(( db_size_bytes / 1024 / 1024 )) MB"
-    client_major="$("$(bin pg_dump)" --version | grep -oE '[0-9]+' | head -n1)"
+    client_major="$("$(bin pg_dump)" --version | tr -d "$CR" | grep -oE '[0-9]+' | head -n1)"
     server_major=$(( server_ver / 10000 ))
     if (( client_major < server_major )); then
         die 2 "pg_dump major version $client_major is older than server $server_major; use a newer pg_dump (--pg-bin)"
     fi
-    free_kb="$(df -Pk "$OUTPUT_DIR" | awk 'NR==2 {print $4}')"
+    free_kb="$(free_kb_of "$OUTPUT_DIR")"
     if [[ "$free_kb" =~ ^[0-9]+$ ]] && (( db_size_bytes / 1024 > free_kb )); then
         log_warn "Database size exceeds free space; an uncompressed dump may not fit"
     fi
@@ -643,7 +781,7 @@ run_dump() {
     # Run pg_dump in the background and wait for it, so TERM traps fire
     # immediately (and can stop pg_dump) instead of after pg_dump finishes.
     local logfd reader_pid
-    exec {logfd}> >(while IFS= read -r l; do _log PG_DUMP "$l"; done)
+    exec {logfd}> >(while IFS= read -r l; do _log PG_DUMP "${l%"$CR"}"; done)
     reader_pid=$!
     "${CMD[@]}" >&"$logfd" 2>&1 &
     PG_DUMP_PID=$!
@@ -675,8 +813,9 @@ verify_dump() {
         log_info "Verification OK (plain dump footer present)"
     else
         local list n
-        list="$("$(bin pg_restore)" --list "$OUTPUT_PATH" 2>&1)" \
-            || die 4 "Verification failed: pg_restore --list error: ${list//$'\n'/ }"
+        list="$("$(bin pg_restore)" --list "$(native_path "$OUTPUT_PATH")" 2>&1)" \
+            || { strip_cr list; die 4 "Verification failed: pg_restore --list error: ${list//$'\n'/ }"; }
+        strip_cr list
         n="$(grep -cvE '^\s*(;|$)' <<<"$list" || true)"
         log_info "Verification OK (pg_restore --list: $n TOC entries)"
     fi
@@ -687,9 +826,11 @@ write_checksum() {
     (
         cd "$OUTPUT_DIR"
         if [[ -d "$FILE_NAME" ]]; then
-            find "$FILE_NAME" -type f -print0 | sort -z | xargs -0 sha256sum
+            local files=() f
+            while IFS= read -r -d '' f; do files+=("$f"); done < <(find "$FILE_NAME" -type f -print0 | sort -z)
+            sha256_files "${files[@]}"
         else
-            sha256sum "$FILE_NAME"
+            sha256_files "$FILE_NAME"
         fi
     ) >"$sumfile" || die 4 "Checksum generation failed"
     log_info "Checksum written: $sumfile"
@@ -799,7 +940,7 @@ build_alert_body() {   # build_alert_body <rc> <status-word>
     local rc="$1" status="$2" dbs
     if (( ${#DB_NAMES[@]} )); then dbs="${DB_NAMES[*]}"; elif (( ALL_DBS )); then dbs="(all)"; else dbs="-"; fi
     {
-        printf 'pg_dump_wrapper %s on %s\n\n' "$status" "$(hostname 2>/dev/null || echo unknown)"
+        printf 'pg_dump_wrapper %s on %s\n\n' "$status" "$(host_name)"
         printf 'Server     : %s:%s (user %s)\n' "$DB_HOST" "$DB_PORT" "$DB_USER"
         printf 'Databases  : %s\n' "$dbs"
         printf 'Exit code  : %s\n' "$rc"
@@ -836,7 +977,7 @@ build_alert_json() {   # build_alert_json <rc> <status-word> <text-body>
     if (( rc != 0 )) && [[ -r "$LOG_FILE" ]]; then tailtxt="$(tail -n "$ALERT_LOG_LINES" "$LOG_FILE" | redact_text)"; fi
     printf '{"status":"%s","exit_code":%d,"failed_stage":"%s","host":"%s","server":"%s:%s","user":"%s","started":"%s","duration_seconds":%d,"output_dir":"%s","log_file":"%s","databases":[%s],"log_tail":"%s","text":"%s"}' \
         "$(json_escape "$status")" "$rc" "$( (( rc != 0 )) && json_escape "$STAGE")" \
-        "$(json_escape "$(hostname 2>/dev/null || echo unknown)")" "$(json_escape "$DB_HOST")" "$DB_PORT" \
+        "$(json_escape "$(host_name)")" "$(json_escape "$DB_HOST")" "$DB_PORT" \
         "$(json_escape "$DB_USER")" "$(json_escape "$RUN_START_TS")" $(( SECONDS - RUN_START )) \
         "$(json_escape "$OUTPUT_DIR")" "$(json_escape "$LOG_FILE")" "$dbjson" "$(json_escape "$tailtxt")" \
         "$(json_escape "$body")"
@@ -910,6 +1051,7 @@ send_alerts() {   # send_alerts <rc> [test]  -- never fails, never changes the e
 on_exit() {
     local rc=$?
     (( IS_CHILD )) && return 0
+    (( PROMPT_PASSWORD )) && unset PGPASSWORD
     trap - EXIT INT TERM
     set +e
     (( MAIN_STARTED )) || exit "$rc"
@@ -951,6 +1093,7 @@ collect_result() {   # collect_result <db> <result-file> <rc>
 # ----------------------------------------------------------------------------
 main() {
     parse_args "$@"
+    normalize_paths
     trap on_exit EXIT
     RUN_START_TS="$(_ts)"
     STAGE="validate"
@@ -968,6 +1111,7 @@ main() {
 
     if (( DRY_RUN )); then
         prepare_output_dir
+        (( ALL_DBS )) && prompt_password   # --all must connect to list the databases
         resolve_databases
         log_info "DRY RUN - pg_dump would be executed as:"
         local db
@@ -980,6 +1124,7 @@ main() {
         exit 0
     fi
 
+    prompt_password
     prepare_output_dir
     trap 'on_signal INT' INT
     trap 'on_signal TERM' TERM
