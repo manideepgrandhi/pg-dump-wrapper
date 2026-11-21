@@ -9,6 +9,12 @@ port=5432
 user=backup_user
 # pgpassfile=/etc/pg_backup/.pgpass
 
+# --- many servers (optional) ---------------------------------------------------
+# One "host,port,user,databases" line per server, e.g. db02.example.com,5433,backup_user,all
+# When set, host= and port= above are ignored and each server writes to output_dir/<host>_<port>/.
+# Passwords come from the pgpass file (one line per host:port); -W is not allowed.
+# servers_file=/etc/pg_backup/servers.txt
+
 # --- which databases -------------------------------------------------------
 # Either a list ...
 dbnames=salesdb,hrdb

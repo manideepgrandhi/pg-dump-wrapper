@@ -6,7 +6,7 @@ Cron-friendly Bash wrappers around the PostgreSQL client tools. They add safe de
 
 | Tool | Version | What it does | Docs |
 |---|---|---|---|
-| [`pg_dump_wrapper.sh`](pg_dump_wrapper.sh) | 2.2.0 | Backups with `pg_dump`: every format, one/many/all databases, verification, sha256 checksums, retention, alerts | [README](#pg_dump_wrappersh) (below) · [Examples](EXAMPLES.md) · [Why this wrapper](WHY_THIS_WRAPPER.md) · [Sample config](pg_dump_wrapper.conf.example) |
+| [`pg_dump_wrapper.sh`](pg_dump_wrapper.sh) | 2.3.0 | Backups with `pg_dump`: every format, one/many/all databases, many servers in one run, verification, sha256 checksums, retention, alerts | [README](#pg_dump_wrappersh) (below) · [Examples](EXAMPLES.md) · [Why this wrapper](WHY_THIS_WRAPPER.md) · [Sample config](pg_dump_wrapper.conf.example) |
 | [`psql_wrapper.sh`](psql_wrapper.sh) | 1.0.0 | One tool, three commands: `migrate` (transactional, tracked SQL migrations with a production guard), `query` (CSV/TSV/JSON/NDJSON exports and scheduled reports), `health` (sizes, connections, locks, long queries, bloat, replication, cache, vacuum, wraparound with WARN/CRIT thresholds) | [README](README_psql.md) · [Examples](EXAMPLES_psql.md) · [Why this wrapper](WHY_PSQL_WRAPPER.md) · [Sample config](psql_wrapper.conf.example) |
 
 A matching `pg_restore` wrapper is planned and not in this repository yet. Until then, restore with the `pg_restore` / `psql` commands shown in [EXAMPLES.md](EXAMPLES.md).
@@ -32,9 +32,10 @@ alerts, so one command (or one cron line) produces reliable, consistently named 
 
 ```
 pg_dump_wrapper.sh (-d DB[,DB...] | --all) [options] [-- extra pg_dump args]
+pg_dump_wrapper.sh --servers FILE [options] [-- extra pg_dump args]
 ```
 
-Version 2.2.0. Needs Bash 4.4 or newer. Runs on Linux and on Windows in Git Bash (see [Windows (Git Bash)](#windows-git-bash)). Changes: [CHANGELOG.md](CHANGELOG.md).
+Version 2.3.0. Needs Bash 4.4 or newer. Runs on Linux and on Windows in Git Bash (see [Windows (Git Bash)](#windows-git-bash)). Changes: [CHANGELOG.md](CHANGELOG.md).
 
 📘 **For copy-paste recipes for every scenario (formats, filters, migration, multiple databases, alerts, cron/systemd, exit codes, errors, restores), see [EXAMPLES.md](EXAMPLES.md).**
 
@@ -111,6 +112,38 @@ abc:sales.customers       OK        -          4.0K     0m00s    /backups/abc_sa
 chatagent:-t sales.orders FAIL(2)   precheck   -        0m00s    -
 inventory:sales.orders    OK        -          428K     0m00s    /backups/inventory_sales_orders_20261121_145304.dump
 inventory:sales.customers OK        -          4.0K     0m00s    /backups/inventory_sales_customers_20261121_145304.dump
+```
+
+### Many servers in one run (`--servers`)
+| Option | Purpose |
+|---|---|
+| `--servers FILE` | Backs up **several servers one after another** in one run, with one summary, one log and one alert. Each line of `FILE` is `host,port,user,databases`. Config: `servers_file=` (or `servers-file=`). |
+
+The servers file:
+
+```
+# host,port,user,databases
+db01.example.com,5432,backup_user,all
+db02.example.com,5433,backup_user,salesdb,hrdb
+db03.example.com,6432,,all
+```
+
+- `databases` is `all` (same as `--all`, `--exclude-db` applies) or a comma list. Everything after the third comma is the list.
+- An empty `user` or `databases` field uses the normal value from the command line or config (`-U`, `-d`, `--all`, `$PGUSER`).
+- Host and port are **required** on every line, so `-h`/`--host` and `-p`/`--port` on the command line are an error with `--servers`. `host=`/`port=` in the config file are ignored (with a warning).
+- Blank lines and `#` comments are skipped, spaces around fields are trimmed, and Windows (CRLF) files work. A missing host, a bad port, a line with no databases (and no `-d`/`--all`), or the same `host:port` twice stops the run before anything is dumped, with the line number in the message.
+- **Passwords come from `.pgpass` only**, one line per server (`host:port:*:user:password`), so every server can have its own password. Use `~/.pgpass`, `%APPDATA%\postgresql\pgpass.conf` on Windows, or `--pgpassfile FILE`. `-W` is an error with `--servers`. Without `--servers`, `-W` prompts as before.
+- Each server writes into its own folder: `OUTPUT_DIR/<host>_<port>/` (for example `/backups/db01.example.com_5432/`), so a database with the same name on two servers never collides. Characters that aren't safe in file names become `_`. Retention, `--verify`, `--checksum`, `--table-sizes` and `--per-table` work inside each server's folder.
+- There's one log file (default `OUTPUT_DIR/pg_dump_wrapper.log`), and every line is tagged with the server, like `[db02.example.com:5433/salesdb]`.
+- If a server is down or its database list can't be read, it gets a `FAIL(2) precheck` row and the run goes on with the next server. With `--stop-on-error`, the remaining servers are marked `SKIPPED`. The exit code is the highest of any row.
+- `--dry-run` lists every server, its folder and its pg_dump commands.
+
+```
+SERVER/DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
+db01.example.com:5432/salesdb   OK        -          144K     0m00s    /backups/db01.example.com_5432/salesdb_20261121_013000.dump
+db01.example.com:5432/hrdb      OK        -          24K      0m01s    /backups/db01.example.com_5432/hrdb_20261121_013000.dump
+db02.example.com:5433           FAIL(2)   precheck   -        0m00s    -
+db03.example.com:6432/salesdb   OK        -          4.0K     0m00s    /backups/db03.example.com_6432/salesdb_20261121_013001.dump
 ```
 
 ### Format and performance
@@ -196,7 +229,7 @@ Files are created with `umask 077` (owner-only permissions).
 | 5 | Retention cleanup failed (the backup itself is fine) |
 | 130 | Interrupted by a signal |
 
-For multiple databases, the run exits with the highest code among the failed databases.
+For multiple databases or servers, the run exits with the highest code among the failed databases and servers.
 
 ## Examples
 
@@ -327,7 +360,7 @@ alert_email=dba@example.com,oncall@example.com
 # alert_webhook=https://hooks.slack.com/services/T000/B000/XXXXXXXX
 alert_webhook_format=slack          # slack ({"text": ...}) | json (structured)
 ```
-Boolean keys accept `yes/no`, `true/false`, `1/0`, and `on/off`. In list keys (`dbnames`, `exclude_db`, `schemas`, `exclude_schemas`, `tables`, `exclude_tables`, `exclude_table_data`, `alert_email`, `alert_webhook`), a CLI value **replaces** the config list instead of adding to it. Other alert keys: `alert_on`, `alert_webhook_format`, `alert_from`. Database keys: `all`, `exclude_db`, `maintenance_db`, `stop_on_error`. A `-d` on the command line overrides `all=yes` from the config, and `--all` overrides `dbnames=`.
+Boolean keys accept `yes/no`, `true/false`, `1/0`, and `on/off`. In list keys (`dbnames`, `exclude_db`, `schemas`, `exclude_schemas`, `tables`, `exclude_tables`, `exclude_table_data`, `alert_email`, `alert_webhook`), a CLI value **replaces** the config list instead of adding to it. Other alert keys: `alert_on`, `alert_webhook_format`, `alert_from`. Database keys: `all`, `exclude_db`, `maintenance_db`, `stop_on_error`. Many servers: `servers_file`. A `-d` on the command line overrides `all=yes` from the config, and `--all` overrides `dbnames=`.
 
 ## Windows (Git Bash)
 
@@ -346,6 +379,7 @@ client tools, for example the ones that ship with pgAdmin or the EDB installer.
 - The CRLF line endings that `psql.exe` / `pg_dump.exe` print are stripped everywhere, so `--all`,
   the version check and database sizes work the same as on Linux.
 - On Windows the libpq password file is `%APPDATA%\postgresql\pgpass.conf` (not `~/.pgpass`), or use `--pgpassfile`.
+- `--servers 'C:\pg\servers.txt'` works too, and the file may be saved with Windows (CRLF) line endings.
 
 ```bash
 ./pg_dump_wrapper.sh -h localhost -U postgres --all \
@@ -355,7 +389,7 @@ client tools, for example the ones that ship with pgAdmin or the EDB installer.
 ## Notes and caveats
 - Needs Bash ≥ 4.4 (5.x recommended), `pg_dump`, and `pg_restore`. `psql` and `pg_isready` are recommended for pre-checks, and `psql` is required for `--all`.
 - `-d` must be a plain database name (not a `postgresql://` URI), because it's also used in the file name.
-- Databases are dumped one after another, not in parallel. Use `-F d -j N` to parallelise inside each database.
+- Databases (and servers with `--servers`) are dumped one after another, not in parallel. Use `-F d -j N` to parallelise inside each database.
 - A superuser can connect even after `REVOKE CONNECT`. A non-superuser backup role will report such databases as `FAIL(2) precheck` under `--all`. Exclude them with `--exclude-db`.
 - E-mail alerts need a working MTA behind `mail`/`sendmail` (postfix, exim, msmtp…). The wrapper only hands the message over. Webhook alerts need `curl`.
 - Slack-format alerts wrap the report in a code block. Very long log lines are sent as-is, and Slack may truncate messages over about 40k characters.
@@ -363,4 +397,4 @@ client tools, for example the ones that ship with pgAdmin or the EDB installer.
 - Retention uses file modification time (`find -mtime +N`) and only deletes entries matching the wrapper's own naming pattern.
 - `--clean` and `--create` only change the SQL in **plain** dumps. For custom/dir/tar dumps, pass them to `pg_restore`.
 - pg_dump takes a consistent snapshot but doesn't include roles or tablespaces. Use `pg_dumpall --globals-only` for those.
-- Tests: `PDW_SERVER_BIN=/usr/lib/postgresql/16/bin tests/test_pg_dump_wrapper.sh` starts a throwaway cluster, runs the Linux and simulated-Windows checks, then stops it and removes its temp dir.
+- Tests: `PDW_SERVER_BIN=/usr/lib/postgresql/16/bin tests/test_pg_dump_wrapper.sh` starts throwaway clusters (a second one on the next port for the `--servers` tests), runs the Linux and simulated-Windows checks, then stops it and removes its temp dir.

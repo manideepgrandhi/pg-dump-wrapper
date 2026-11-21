@@ -2,7 +2,8 @@
 #
 # pg_dump_wrapper.sh - opinionated, cron-friendly wrapper around PostgreSQL pg_dump
 #
-# Features: one or many databases per run (-d list or --all), long/short options,
+# Features: one or many databases per run (-d list or --all), many servers per run
+# (--servers FILE with host,port,user,databases lines), long/short options,
 # optional key=value config file (CLI overrides it), timestamped output names,
 # logging to console + file, pre-checks (binaries, connectivity, disk space),
 # dry-run, post-dump verification, sha256 checksum, safe per-database retention,
@@ -29,7 +30,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.3.0"
 
 # ----------------------------------------------------------------------------
 # Platform (Windows = Git Bash / MSYS2 / Cygwin; everything else behaves as Linux)
@@ -38,6 +39,7 @@ readonly CR=$'\r'                                 # Windows tools end lines with
 readonly WINDOWS_UNAME_RE='^(MINGW|MSYS|CYGWIN)'   # `uname -s` prefixes of Windows bash ports
 readonly WINDOWS_EXE_SUFFIX=".exe"
 readonly CHECKSUM_BITS=256                         # SHA-256 (sha256sum, or shasum -a 256)
+readonly PG_ISREADY_TIMEOUT=10                      # seconds pg_isready waits for each server
 readonly TTY_DEVICE="/dev/tty"                     # where -W reads the password from
 readonly DEFAULT_TABLE_SIZES=10                    # largest tables listed before each dump (0 = off, all = every table)
 readonly FIELD_SEP=$'\x1f'                         # column separator for psql -A output (never in names)
@@ -45,6 +47,8 @@ readonly FILE_DATE_FORMAT='%Y%m%d_%H%M%S'          # the {date} part of every ba
 readonly FILE_DATE_GLOB='[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]'
 readonly DEFAULT_PER_TABLE_FILE_PATTERN='{db}_{schema}_{table}_{date}.{ext}'
 readonly PER_TABLE_REQUIRED_TOKENS=(db schema table date)
+readonly SERVERS_ALL_KEYWORD="all"                 # databases field of a --servers line meaning --all
+readonly SERVERS_LINE_FORMAT="host,port,user,databases"
 readonly UNSAFE_FILE_CHARS='[/\\:*?"<>|[:cntrl:][:space:]]'   # replaced by _ in per-table file names
 IS_WINDOWS=0
 _uname="$(uname -s 2>/dev/null || true)"
@@ -93,6 +97,14 @@ PG_BIN=""
 PGPASSFILE_OPT=""
 CONFIG_FILE=""
 EXTRA_ARGS=()
+# many servers (--servers FILE / servers_file=)
+SERVERS_FILE=""
+CLI_HOST_PORT_OPT=""   # -h/-p given on the command line (not allowed with --servers)
+CONF_HOST_PORT=0       # host=/port= given in the config (ignored with --servers)
+SRV_HOSTS=(); SRV_PORTS=(); SRV_USERS=(); SRV_DBS=()   # one entry per servers-file line
+SERVER_LABEL=""        # "host:port" of the server being dumped (prefix of results and log tags)
+BASE_OUTPUT_DIR=""     # --servers: the -o dir; each server writes to BASE_OUTPUT_DIR/<host>_<port>
+BASE_USER=""; BASE_DBS=(); BASE_ALL=0; CURRENT_SRV=0
 # alerts
 ALERT_EMAILS=()
 ALERT_WEBHOOKS=()
@@ -138,6 +150,7 @@ _log() {
     local level="$1"; shift
     local line
     local tag="${UNIT_LABEL:-$DB_NAME}"
+    [[ -n "$SERVER_LABEL" && -z "$UNIT_LABEL" ]] && tag="$SERVER_LABEL${DB_NAME:+/$DB_NAME}"
     line="$(_ts) [$level]${tag:+ [$tag]} $*"
     printf '%s\n' "$line" >&2
     if [[ -n "$LOG_FILE" && "$DRY_RUN" -eq 0 ]]; then
@@ -163,6 +176,7 @@ usage() {
 $SCRIPT_NAME v$SCRIPT_VERSION - wrapper around pg_dump
 
 Usage: $SCRIPT_NAME (-d DB[,DB...] | --all) [options] [-- extra pg_dump args]
+       $SCRIPT_NAME --servers FILE [options] [-- extra pg_dump args]
 
 Connection:
   -h, --host HOST              Server host or socket dir          (default: \$PGHOST or localhost)
@@ -171,6 +185,14 @@ Connection:
   -W, --password               Prompt once for the password at the start (needs a terminal);
                                it is used for every database and never stored or logged
       --pgpassfile FILE        Use this .pgpass file (sets PGPASSFILE)
+
+Many servers (one after another, one summary):
+      --servers FILE           One server per line: $SERVERS_LINE_FORMAT
+                               e.g. "db1.example.com,5432,dbadmin,$SERVERS_ALL_KEYWORD" or "db2.example.com,5433,,sales,hr"
+                               (databases = $SERVERS_ALL_KEYWORD or a comma list; empty user/databases = the
+                               usual -U / -d / --all). Each server writes to OUTPUT_DIR/<host>_<port>/.
+                               Host and port come from the file, so -h/-p are not allowed.
+                               Passwords come from .pgpass (one line per host:port); -W is not allowed.
 
 Databases (each database gets its own dump file):
   -d, --dbname DB              Database(s) to dump; repeatable or comma-separated
@@ -236,7 +258,7 @@ Behaviour:
   --                           Everything after -- is passed to pg_dump verbatim
 
 Exit codes: 0 ok, 1 usage, 2 pre-check, 3 pg_dump, 4 verify/checksum, 5 retention, 130 interrupted
-(multi-database runs exit with the highest code of any failed database)
+(multi-database / multi-server runs exit with the highest code of any failed database or server)
 USAGE
 }
 
@@ -256,6 +278,8 @@ add_list() {
     done
     return 0
 }
+
+trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; printf '%s' "${v%"${v##*[![:space:]]}"}"; }
 
 is_true() {
     case "${1,,}" in 1|y|yes|true|on) return 0 ;; *) return 1 ;; esac
@@ -319,6 +343,7 @@ normalize_paths() {   # Windows: accept C:\x, C:/x and /c/x for every path optio
     LOG_FILE="$(to_unix_path "$LOG_FILE")"
     PG_BIN="$(to_unix_path "$PG_BIN")"
     PGPASSFILE_OPT="$(to_unix_path "$PGPASSFILE_OPT")"
+    SERVERS_FILE="$(to_unix_path "$SERVERS_FILE")"
     [[ -n "${TMPDIR:-}" ]] && TMPDIR="$(to_unix_path "$TMPDIR")"
     log_debug "Windows paths: output_dir=$OUTPUT_DIR log_file=${LOG_FILE:-<default>} pg_bin=${PG_BIN:-<PATH>} pgpassfile=${PGPASSFILE_OPT:-<none>}"
     return 0
@@ -402,8 +427,9 @@ load_config() {
             val="${val%"${val##*[![:space:]]}"}"
         fi
         case "$key" in
-            host)               DB_HOST="$val" ;;
-            port)               DB_PORT="$val" ;;
+            host)               DB_HOST="$val"; CONF_HOST_PORT=1 ;;
+            port)               DB_PORT="$val"; CONF_HOST_PORT=1 ;;
+            servers_file|servers) SERVERS_FILE="$val" ;;
             user|username)      DB_USER="$val" ;;
             dbname|database|dbnames|databases) DB_NAMES=(); add_list DB_NAMES "$val" ;;
             all|all_databases)  is_true "$val" && ALL_DBS=1 || ALL_DBS=0 ;;
@@ -476,8 +502,9 @@ parse_args() {
             set -- "$opt" "$val" "${@:2}"
         fi
         case "$opt" in
-            -h|--host)          need_arg "$opt" $#; DB_HOST="$2"; shift 2 ;;
-            -p|--port)          need_arg "$opt" $#; DB_PORT="$2"; shift 2 ;;
+            -h|--host)          need_arg "$opt" $#; DB_HOST="$2"; CLI_HOST_PORT_OPT="$opt"; shift 2 ;;
+            -p|--port)          need_arg "$opt" $#; DB_PORT="$2"; CLI_HOST_PORT_OPT="$opt"; shift 2 ;;
+            --servers)          need_arg "$opt" $#; SERVERS_FILE="$2"; shift 2 ;;
             -U|--user|--username) need_arg "$opt" $#; DB_USER="$2"; shift 2 ;;
             -d|--dbname)        need_arg "$opt" $#; ((cli_d++)) || DB_NAMES=(); add_list DB_NAMES "$2"; shift 2 ;;
             --all)              ALL_DBS=1; cli_all=1; shift ;;
@@ -561,9 +588,11 @@ validate_alerts() {
 validate() {
     if (( ALL_DBS )); then
         (( ${#DB_NAMES[@]} )) && die 1 "Use either -d/--dbname or --all, not both"
+    elif [[ -n "$SERVERS_FILE" ]]; then
+        :   # databases may come from each servers-file line (checked in load_servers_file)
     else
         (( ${#DB_NAMES[@]} )) || die 1 "Database name is required (-d/--dbname or --all). See --help."
-        (( ${#EXCLUDE_DBS[@]} )) && log_warn "--exclude-db only applies with --all; ignoring"
+        (( ${#EXCLUDE_DBS[@]} )) && [[ -z "$SERVERS_FILE" ]] && log_warn "--exclude-db only applies with --all; ignoring"
     fi
     local d
     for d in "${DB_NAMES[@]}"; do
@@ -573,7 +602,7 @@ validate() {
         die 1 "-f/--file can only be used with a single database"
     fi
 
-    if [[ ! "$DB_PORT" =~ ^[0-9]+$ ]] || (( DB_PORT < 1 || DB_PORT > 65535 )); then
+    if [[ -z "$SERVERS_FILE" ]] && { [[ ! "$DB_PORT" =~ ^[0-9]+$ ]] || (( DB_PORT < 1 || DB_PORT > 65535 )); }; then
         die 1 "Invalid port: $DB_PORT"
     fi
 
@@ -626,7 +655,88 @@ validate() {
         PGPASSFILE="$(native_path "$PGPASSFILE_OPT")"
         export PGPASSFILE
     fi
+    [[ -n "$SERVERS_FILE" ]] && validate_servers
     return 0
+}
+
+# ----------------------------------------------------------------------------
+# Many servers (--servers FILE): one "host,port,user,databases" line per server
+# ----------------------------------------------------------------------------
+server_dir_name() { safe_name "$1_$2"; }   # server_dir_name <host> <port> -> folder under OUTPUT_DIR
+
+validate_servers() {
+    [[ -z "$CLI_HOST_PORT_OPT" ]] \
+        || die 1 "$CLI_HOST_PORT_OPT cannot be used with --servers: host and port come from each line of the servers file"
+    (( PROMPT_PASSWORD )) \
+        && die 1 "-W cannot be used with --servers (each server has its own password)." \
+                 "Put one line per server in ~/.pgpass (%APPDATA%\\postgresql\\pgpass.conf on Windows) or use --pgpassfile FILE:" \
+                 "host:port:*:user:password"
+    [[ -z "$FILE_NAME" ]] || die 1 "-f/--file cannot be used with --servers"
+    (( CONF_HOST_PORT )) && log_warn "host=/port= in the config file are ignored: --servers sets them for each server"
+    [[ -n "${PGPASSWORD:-}" ]] && log_warn "PGPASSWORD is set and will be tried for every server; per-server passwords belong in .pgpass"
+    load_servers_file
+}
+
+load_servers_file() {
+    local file="$SERVERS_FILE" line lineno=0 host port user dbs dir d
+    local -A seen=()
+    local -a list
+    [[ -r "$file" && ! -d "$file" ]] || die 1 "Servers file not readable: $file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        line="${line//$CR/}"                                  # Windows-edited files (CRLF)
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        host=""; port=""; user=""; dbs=""
+        IFS=',' read -r host port user dbs <<<"$line"         # dbs = everything after the 3rd comma
+        host="$(trim "$host")"; port="$(trim "$port")"; user="$(trim "$user")"; dbs="$(trim "$dbs")"
+        [[ -n "$host" ]] || die 1 "Servers file $file:$lineno: host is missing (expected $SERVERS_LINE_FORMAT)"
+        [[ "$host" != *[[:space:]]* ]] || die 1 "Servers file $file:$lineno: host '$host' contains spaces"
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+            die 1 "Servers file $file:$lineno: invalid port '$port' for host $host (expected a number 1-65535; line format $SERVERS_LINE_FORMAT)"
+        fi
+        port=$(( 10#$port ))
+        if [[ -z "$dbs" ]]; then
+            (( ALL_DBS || ${#DB_NAMES[@]} )) \
+                || die 1 "Servers file $file:$lineno: no databases for $host:$port; add them to the line ($SERVERS_ALL_KEYWORD or db1,db2) or give -d / --all"
+        elif [[ "${dbs,,}" == "$SERVERS_ALL_KEYWORD" ]]; then
+            dbs="$SERVERS_ALL_KEYWORD"
+        else
+            list=(); add_list list "$dbs"
+            for d in "${list[@]}"; do
+                [[ "$d" != */* ]] || die 1 "Servers file $file:$lineno: database name must not contain '/': $d"
+            done
+        fi
+        dir="$(server_dir_name "$host" "$port")"
+        [[ -z "${seen[$dir]:-}" ]] || die 1 "Servers file $file:$lineno: $host:$port is already listed on line ${seen[$dir]}"
+        seen[$dir]=$lineno
+        SRV_HOSTS+=("$host"); SRV_PORTS+=("$port"); SRV_USERS+=("$user"); SRV_DBS+=("$dbs")
+    done <"$file"
+    (( ${#SRV_HOSTS[@]} )) || die 1 "Servers file $file lists no servers (expected $SERVERS_LINE_FORMAT lines)"
+    log_debug "Servers file $file: ${#SRV_HOSTS[@]} server(s)"
+    return 0
+}
+
+server_list() {   # "h1:p1, h2:p2"
+    local i out=""
+    for i in "${!SRV_HOSTS[@]}"; do out+="${out:+, }${SRV_HOSTS[$i]}:${SRV_PORTS[$i]}"; done
+    printf '%s' "$out"
+}
+
+use_server() {   # use_server <index>: point DB_HOST/DB_PORT/DB_USER/databases/OUTPUT_DIR at one server
+    local s="$1"
+    DB_HOST="${SRV_HOSTS[$s]}"; DB_PORT="${SRV_PORTS[$s]}"; DB_USER="${SRV_USERS[$s]:-$BASE_USER}"
+    case "${SRV_DBS[$s]}" in
+        "")                    DB_NAMES=("${BASE_DBS[@]}"); ALL_DBS=$BASE_ALL ;;
+        "$SERVERS_ALL_KEYWORD") DB_NAMES=(); ALL_DBS=1 ;;
+        *)                     DB_NAMES=(); add_list DB_NAMES "${SRV_DBS[$s]}"; ALL_DBS=0 ;;
+    esac
+    OUTPUT_DIR="$BASE_OUTPUT_DIR/$(server_dir_name "$DB_HOST" "$DB_PORT")"
+    SERVER_LABEL="$DB_HOST:$DB_PORT"
+    CURRENT_SRV=$s
+}
+
+save_base_settings() {   # remember -o, -U, -d/--all before use_server changes them
+    BASE_OUTPUT_DIR="$OUTPUT_DIR"; BASE_USER="$DB_USER"; BASE_DBS=("${DB_NAMES[@]}"); BASE_ALL=$ALL_DBS
 }
 
 # ----------------------------------------------------------------------------
@@ -656,14 +766,15 @@ prompt_password() {
 # ----------------------------------------------------------------------------
 # Database list (--all)
 # ----------------------------------------------------------------------------
-resolve_databases() {
+resolve_databases() {   # returns 0, or an exit code with the reason in SRV_ERR
     (( ALL_DBS )) || return 0
-    command -v "$(bin psql)" >/dev/null 2>&1 || die 2 "--all requires psql to list databases"
+    command -v "$(bin psql)" >/dev/null 2>&1 || { SRV_ERR="--all requires psql to list databases"; return 2; }
     local out db pat skip
     if ! out="$("$(bin psql)" -X -w -At -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$MAINTENANCE_DB" \
             -c "SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate ORDER BY datname" 2>&1)"; then
         strip_cr out
-        die 2 "Cannot list databases via '$MAINTENANCE_DB': ${out//$'\n'/ }"
+        SRV_ERR="Cannot list databases via '$MAINTENANCE_DB': ${out//$'\n'/ }"
+        return 2
     fi
     strip_cr out
     DB_NAMES=()
@@ -678,9 +789,11 @@ resolve_databases() {
         if [[ "$db" == */* ]]; then log_warn "Skipping database with '/' in its name: $db"; continue; fi
         DB_NAMES+=("$db")
     done <<<"$out"
-    (( ${#DB_NAMES[@]} )) || die 1 "--all matched no databases (after --exclude-db)"
+    (( ${#DB_NAMES[@]} )) || { SRV_ERR="--all matched no databases (after --exclude-db)"; return 1; }
     log_info "Databases selected by --all: ${DB_NAMES[*]}"
+    return 0
 }
+SRV_ERR=""
 
 # ----------------------------------------------------------------------------
 # Table patterns (-t/--table, from wrapper options and from extra pg_dump args)
@@ -1021,11 +1134,7 @@ global_prechecks() {   # once per run
 
     (( SKIP_PRECHECK )) && { log_warn "Skipping connectivity and disk-space checks"; return 0; }
 
-    if command -v "$(bin pg_isready)" >/dev/null 2>&1; then
-        "$(bin pg_isready)" -q -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -t 10 \
-            || die 2 "Server not accepting connections at $DB_HOST:$DB_PORT (pg_isready)"
-        log_debug "pg_isready OK"
-    fi
+    if [[ -z "$SERVERS_FILE" ]]; then server_ready || die 2 "$SRV_ERR"; fi   # --servers: checked per server
 
     local free_kb free_mb
     free_kb="$(free_kb_of "$OUTPUT_DIR")"
@@ -1034,6 +1143,15 @@ global_prechecks() {   # once per run
         log_info "Free space in $OUTPUT_DIR: ${free_mb} MB"
         (( free_mb < MIN_FREE_MB )) && log_warn "Free space ${free_mb} MB is below --min-free-mb ${MIN_FREE_MB} MB"
     fi
+    return 0
+}
+
+server_ready() {   # pg_isready for DB_HOST:DB_PORT; 1 with the reason in SRV_ERR
+    command -v "$(bin pg_isready)" >/dev/null 2>&1 || return 0
+    if ! "$(bin pg_isready)" -q -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -t "$PG_ISREADY_TIMEOUT"; then
+        SRV_ERR="Server not accepting connections at $DB_HOST:$DB_PORT (pg_isready)"; return 1
+    fi
+    log_debug "pg_isready OK"
     return 0
 }
 
@@ -1213,6 +1331,7 @@ dump_one_db() {   # dump_one_db <dbname> <result-file> [schema table]   (called 
 summary_lines() {
     local r db rc stage size dur file status w=24
     local head="DATABASE"; (( PER_TABLE )) && head="DATABASE:TABLE"
+    [[ -n "$SERVERS_FILE" ]] && head="SERVER/$head"
     for r in "${RESULTS[@]}"; do db="${r%%|*}"; (( ${#db} > w )) && w=${#db}; done   # long db:table labels
     printf "%-${w}s %-9s %-10s %-8s %-8s %s\n" "$head" "STATUS" "STAGE" "SIZE" "TIME" "FILE"
     for r in "${RESULTS[@]}"; do
@@ -1242,13 +1361,17 @@ build_alert_body() {   # build_alert_body <rc> <status-word>
     if (( ${#DB_NAMES[@]} )); then dbs="${DB_NAMES[*]}"; elif (( ALL_DBS )); then dbs="(all)"; else dbs="-"; fi
     {
         printf 'pg_dump_wrapper %s on %s\n\n' "$status" "$(host_name)"
-        printf 'Server     : %s:%s (user %s)\n' "$DB_HOST" "$DB_PORT" "$DB_USER"
-        printf 'Databases  : %s\n' "$dbs"
+        if [[ -n "$SERVERS_FILE" ]]; then
+            printf 'Servers    : %s (from %s)\n' "$(server_list)" "$SERVERS_FILE"
+        else
+            printf 'Server     : %s:%s (user %s)\n' "$DB_HOST" "$DB_PORT" "$DB_USER"
+            printf 'Databases  : %s\n' "$dbs"
+        fi
         printf 'Exit code  : %s\n' "$rc"
         (( rc != 0 )) && printf 'Failed at  : %s\n' "$STAGE"
         printf 'Started    : %s\n' "$RUN_START_TS"
         printf 'Duration   : %s\n' "$(fmt_duration $(( SECONDS - RUN_START )))"
-        printf 'Output dir : %s\n' "$OUTPUT_DIR"
+        printf 'Output dir : %s\n' "${BASE_OUTPUT_DIR:-$OUTPUT_DIR}"
         printf 'Log file   : %s\n' "$LOG_FILE"
         if (( ${#RESULTS[@]} )); then printf '\n'; summary_lines; fi
         if (( rc != 0 )) && [[ -r "$LOG_FILE" ]]; then
@@ -1274,13 +1397,14 @@ build_alert_json() {   # build_alert_json <rc> <status-word> <text-body>
             "$(json_escape "$db")" "$(json_escape "$drc")" "$(json_escape "$stage")" "$(json_escape "$size")" \
             "$(json_escape "$dur")" "$(json_escape "$file")")"
     done
-    local tailtxt=""
+    local tailtxt="" server="$DB_HOST:$DB_PORT"
+    [[ -n "$SERVERS_FILE" ]] && server="$(server_list)"
     if (( rc != 0 )) && [[ -r "$LOG_FILE" ]]; then tailtxt="$(tail -n "$ALERT_LOG_LINES" "$LOG_FILE" | redact_text)"; fi
-    printf '{"status":"%s","exit_code":%d,"failed_stage":"%s","host":"%s","server":"%s:%s","user":"%s","started":"%s","duration_seconds":%d,"output_dir":"%s","log_file":"%s","databases":[%s],"log_tail":"%s","text":"%s"}' \
+    printf '{"status":"%s","exit_code":%d,"failed_stage":"%s","host":"%s","server":"%s","user":"%s","started":"%s","duration_seconds":%d,"output_dir":"%s","log_file":"%s","databases":[%s],"log_tail":"%s","text":"%s"}' \
         "$(json_escape "$status")" "$rc" "$( (( rc != 0 )) && json_escape "$STAGE")" \
-        "$(json_escape "$(host_name)")" "$(json_escape "$DB_HOST")" "$DB_PORT" \
+        "$(json_escape "$(host_name)")" "$(json_escape "$server")" \
         "$(json_escape "$DB_USER")" "$(json_escape "$RUN_START_TS")" $(( SECONDS - RUN_START )) \
-        "$(json_escape "$OUTPUT_DIR")" "$(json_escape "$LOG_FILE")" "$dbjson" "$(json_escape "$tailtxt")" \
+        "$(json_escape "${BASE_OUTPUT_DIR:-$OUTPUT_DIR}")" "$(json_escape "$LOG_FILE")" "$dbjson" "$(json_escape "$tailtxt")" \
         "$(json_escape "$body")"
 }
 
@@ -1330,6 +1454,7 @@ send_alerts() {   # send_alerts <rc> [test]  -- never fails, never changes the e
     if (( ${#DB_NAMES[@]} )); then dbs="${DB_NAMES[*]}"; else dbs="(all)"; fi
     (( ${#dbs} > 60 )) && dbs="${dbs:0:57}..."
     subject="[pg_dump_wrapper] $status: $dbs on $DB_HOST (exit $rc)"
+    [[ -n "$SERVERS_FILE" ]] && subject="[pg_dump_wrapper] $status: ${#SRV_HOSTS[@]} server(s) from ${SERVERS_FILE##*/} (exit $rc)"
     body="$(build_alert_body "$rc" "$status")"
     if (( ${#ALERT_EMAILS[@]} )); then
         if send_email_alert "$subject" "$body"; then
@@ -1370,23 +1495,27 @@ on_exit() {
 # shellcheck disable=SC2317  # invoked indirectly via trap
 on_signal() {
     _log ERROR "Interrupted by signal $1"
+    local k
     if [[ -n "$CHILD_PID" ]] && kill -0 "$CHILD_PID" 2>/dev/null; then
         kill -TERM "$CHILD_PID" 2>/dev/null || true
         wait "$CHILD_PID" 2>/dev/null || true
         collect_result "$CURRENT_DB" "$CURRENT_RES" 130
-        local k
         local t sc tb
         for (( k = CURRENT_TIDX + 1; k < ${#PT_TABLES[@]}; k++ )); do
             t="${PT_TABLES[$k]}"; sc="${t%%"$FIELD_SEP"*}"; tb="${t#*"$FIELD_SEP"}"
             RESULTS+=("$(unit_label "$CURRENT_DBNAME" "$sc" "$tb" | tr '|' _)|skipped|-|-|0|-")
         done
-        for (( k = CURRENT_IDX + 1; k < ${#DB_NAMES[@]}; k++ )); do RESULTS+=("${DB_NAMES[$k]}|skipped|-|-|0|-"); done
+        for (( k = CURRENT_IDX + 1; k < ${#DB_NAMES[@]}; k++ )); do RESULTS+=("$(unit_label "${DB_NAMES[$k]}")|skipped|-|-|0|-"); done
+    fi
+    if [[ -n "$SERVERS_FILE" ]] && (( MAIN_STARTED )); then
+        for (( k = CURRENT_SRV + 1; k < ${#SRV_HOSTS[@]}; k++ )); do RESULTS+=("${SRV_HOSTS[$k]}:${SRV_PORTS[$k]}|skipped|-|-|0|-"); done
     fi
     STAGE="interrupted"
     exit 130
 }
 
-unit_label() {   # unit_label <db> [schema table] -> "db" or "db:schema.table"
+unit_label() {   # unit_label <db> [schema table] -> "db" or "db:schema.table" ("host:port/" first with --servers)
+    printf '%s' "${SERVER_LABEL:+$SERVER_LABEL/}"
     if [[ -n "${3:-}" ]]; then printf '%s:%s.%s' "$1" "$2" "$3"; else printf '%s' "$1"; fi
 }
 
@@ -1472,27 +1601,28 @@ main() {
         prepare_output_dir
         # --all and the table-size report must connect
         if (( ALL_DBS || PER_TABLE )) || [[ "$TABLE_SIZES" != 0 ]]; then prompt_password; fi
-        resolve_databases
-        log_info "DRY RUN - pg_dump would be executed as:"
-        local db t
-        for db in "${DB_NAMES[@]}"; do
-            DB_NAME="$db"
-            if (( PER_TABLE )); then
-                if ! per_table_list "$db"; then continue; fi
-                (( ${#PT_EXACT[@]} )) && show_table_sizes "${PT_EXACT[@]}"
-                for t in "${PT_TABLES[@]}"; do
-                    TABLE_SCHEMA="${t%%"$FIELD_SEP"*}"; TABLE_NAME="${t#*"$FIELD_SEP"}"
-                    prepare_output_path; build_command; print_command
-                done
-                TABLE_SCHEMA=""; TABLE_NAME=""
-            else
-                show_table_sizes; prepare_output_path; build_command; print_command
-            fi
-        done
-        DB_NAME=""
-        [[ -n "$RETENTION_DAYS" ]] && log_info "DRY RUN - would delete <db>_YYYYmmdd_HHMMSS.* in $OUTPUT_DIR older than $RETENTION_DAYS days"
+        local rc=0 dry_rc=0 s
+        if [[ -z "$SERVERS_FILE" ]]; then
+            resolve_databases || die "$?" "$SRV_ERR"
+            log_info "DRY RUN - pg_dump would be executed as:"
+            dry_run_databases
+            [[ -n "$RETENTION_DAYS" ]] && log_info "DRY RUN - would delete <db>_YYYYmmdd_HHMMSS.* in $OUTPUT_DIR older than $RETENTION_DAYS days"
+        else
+            save_base_settings
+            log_info "DRY RUN - ${#SRV_HOSTS[@]} server(s) from $SERVERS_FILE, one after another:"
+            for s in "${!SRV_HOSTS[@]}"; do
+                use_server "$s"
+                log_info "Server $((s + 1))/${#SRV_HOSTS[@]}: $DB_HOST:$DB_PORT user=$DB_USER -> $OUTPUT_DIR"
+                rc=0; resolve_databases || rc=$?
+                if (( rc )); then log_error "$SRV_ERR"; (( rc > dry_rc )) && dry_rc=$rc; continue; fi
+                log_info "DRY RUN - pg_dump would be executed as:"
+                dry_run_databases
+            done
+            SERVER_LABEL=""; OUTPUT_DIR="$BASE_OUTPUT_DIR"
+            [[ -n "$RETENTION_DAYS" ]] && log_info "DRY RUN - would delete <db>_YYYYmmdd_HHMMSS.* older than $RETENTION_DAYS days in each <host>_<port> folder under $OUTPUT_DIR"
+        fi
         (( ${#ALERT_EMAILS[@]} + ${#ALERT_WEBHOOKS[@]} )) && log_info "DRY RUN - alerts (on $ALERT_ON) -> ${#ALERT_EMAILS[@]} e-mail, ${#ALERT_WEBHOOKS[@]} webhook target(s)"
-        exit 0
+        exit "$dry_rc"
     fi
 
     prompt_password
@@ -1500,47 +1630,103 @@ main() {
     trap 'on_signal INT' INT
     trap 'on_signal TERM' TERM
 
-    log_info "===== $SCRIPT_NAME v$SCRIPT_VERSION: host=$DB_HOST port=$DB_PORT user=$DB_USER ====="
-    STAGE="precheck"
-    global_prechecks
-    resolve_databases
-    log_info "Databases to dump (${#DB_NAMES[@]}): ${DB_NAMES[*]}"
-
     RESULT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pg_dump_wrapper.XXXXXX")"
-    local i db t k
-    CURRENT_DB=""; CURRENT_RES=""; CURRENT_IDX=0; CURRENT_TIDX=0; CURRENT_DBNAME=""; PT_TABLES=()
-    for i in "${!DB_NAMES[@]}"; do
-        db="${DB_NAMES[$i]}"
-        CURRENT_IDX=$i; CURRENT_DBNAME="$db"; PT_TABLES=(); CURRENT_TIDX=0
-        if stopping; then RESULTS+=("$db|skipped|-|-|0|-"); continue; fi
-        if (( ! PER_TABLE )); then
-            run_unit "$db" "$RESULT_DIR/$i.res"
-            continue
-        fi
-        DB_NAME="$db"
-        if ! per_table_list "$db"; then
-            DB_NAME=""; record_failure "$db" 2 precheck; continue
-        fi
-        (( ${#PT_EXACT[@]} )) && show_table_sizes "${PT_EXACT[@]}"
-        DB_NAME=""
-        for t in "${PT_MISSING[@]}"; do record_failure "$db:$t" 2 precheck; done
-        for k in "${!PT_TABLES[@]}"; do
-            t="${PT_TABLES[$k]}"; CURRENT_TIDX=$k
-            if stopping; then
-                RESULTS+=("$(unit_label "$db" "${t%%"$FIELD_SEP"*}" "${t#*"$FIELD_SEP"}" | tr '|' _)|skipped|-|-|0|-")
-                continue
-            fi
-            run_unit "$db" "$RESULT_DIR/$i.$k.res" "${t%%"$FIELD_SEP"*}" "${t#*"$FIELD_SEP"}"
-        done
-        PT_TABLES=()
-    done
-    CURRENT_DB=""
+    STAGE="precheck"
+    if [[ -z "$SERVERS_FILE" ]]; then
+        log_info "===== $SCRIPT_NAME v$SCRIPT_VERSION: host=$DB_HOST port=$DB_PORT user=$DB_USER ====="
+        global_prechecks
+        resolve_databases || die "$?" "$SRV_ERR"
+        log_info "Databases to dump (${#DB_NAMES[@]}): ${DB_NAMES[*]}"
+        dump_databases ""
+    else
+        log_info "===== $SCRIPT_NAME v$SCRIPT_VERSION: ${#SRV_HOSTS[@]} server(s) from $SERVERS_FILE: $(server_list) ====="
+        global_prechecks
+        save_base_settings
+        dump_servers
+    fi
     if (( RUN_WORST != 0 )); then
         STAGE="$FIRST_FAIL_STAGE"
         exit "$RUN_WORST"
     fi
     STAGE="done"
     exit 0
+}
+
+# --dry-run: print the pg_dump command(s) for DB_NAMES on the current server.
+dry_run_databases() {
+    local db t
+    for db in "${DB_NAMES[@]}"; do
+        DB_NAME="$db"
+        if (( PER_TABLE )); then
+            if ! per_table_list "$db"; then continue; fi
+            (( ${#PT_EXACT[@]} )) && show_table_sizes "${PT_EXACT[@]}"
+            for t in "${PT_TABLES[@]}"; do
+                TABLE_SCHEMA="${t%%"$FIELD_SEP"*}"; TABLE_NAME="${t#*"$FIELD_SEP"}"
+                prepare_output_path; build_command; print_command
+            done
+            TABLE_SCHEMA=""; TABLE_NAME=""
+        else
+            show_table_sizes; prepare_output_path; build_command; print_command
+        fi
+    done
+    DB_NAME=""
+    return 0
+}
+
+# Dump every database in DB_NAMES on the current server (one child per database or table).
+dump_databases() {   # dump_databases <result-file-prefix>
+    local pfx="$1" i db t k
+    CURRENT_DB=""; CURRENT_RES=""; CURRENT_IDX=0; CURRENT_TIDX=0; CURRENT_DBNAME=""; PT_TABLES=()
+    for i in "${!DB_NAMES[@]}"; do
+        db="${DB_NAMES[$i]}"
+        CURRENT_IDX=$i; CURRENT_DBNAME="$db"; PT_TABLES=(); CURRENT_TIDX=0
+        if stopping; then RESULTS+=("$(unit_label "$db" | tr '|' _)|skipped|-|-|0|-"); continue; fi
+        if (( ! PER_TABLE )); then
+            run_unit "$db" "$RESULT_DIR/$pfx$i.res"
+            continue
+        fi
+        DB_NAME="$db"
+        if ! per_table_list "$db"; then
+            DB_NAME=""; record_failure "$(unit_label "$db")" 2 precheck; continue
+        fi
+        (( ${#PT_EXACT[@]} )) && show_table_sizes "${PT_EXACT[@]}"
+        DB_NAME=""
+        for t in "${PT_MISSING[@]}"; do record_failure "$(unit_label "$db:$t")" 2 precheck; done
+        for k in "${!PT_TABLES[@]}"; do
+            t="${PT_TABLES[$k]}"; CURRENT_TIDX=$k
+            if stopping; then
+                RESULTS+=("$(unit_label "$db" "${t%%"$FIELD_SEP"*}" "${t#*"$FIELD_SEP"}" | tr '|' _)|skipped|-|-|0|-")
+                continue
+            fi
+            run_unit "$db" "$RESULT_DIR/$pfx$i.$k.res" "${t%%"$FIELD_SEP"*}" "${t#*"$FIELD_SEP"}"
+        done
+        PT_TABLES=()
+    done
+    CURRENT_DB=""
+    return 0
+}
+
+# --servers: every server in turn. A server that cannot be reached or listed gets a
+# FAIL row and the run goes on with the next one (unless --stop-on-error).
+dump_servers() {
+    local s rc
+    for s in "${!SRV_HOSTS[@]}"; do
+        use_server "$s"
+        if stopping; then RESULTS+=("$SERVER_LABEL|skipped|-|-|0|-"); continue; fi
+        log_info "----- Server $((s + 1))/${#SRV_HOSTS[@]}: $DB_HOST:$DB_PORT user=$DB_USER -> $OUTPUT_DIR"
+        if ! mkdir -p "$OUTPUT_DIR" 2>/dev/null || [[ ! -w "$OUTPUT_DIR" ]]; then
+            log_error "Cannot create or write output dir: $OUTPUT_DIR"; record_failure "$SERVER_LABEL" 2 precheck; continue
+        fi
+        if (( ! SKIP_PRECHECK )) && ! server_ready; then
+            log_error "$SRV_ERR"; record_failure "$SERVER_LABEL" 2 precheck; continue
+        fi
+        rc=0; resolve_databases || rc=$?
+        if (( rc )); then log_error "$SRV_ERR"; record_failure "$SERVER_LABEL" "$rc" precheck; continue; fi
+        log_info "Databases to dump (${#DB_NAMES[@]}): ${DB_NAMES[*]}"
+        dump_databases "$s."
+    done
+    SERVER_LABEL=""; OUTPUT_DIR="$BASE_OUTPUT_DIR"
+    return 0
 }
 
 main "$@"

@@ -2,6 +2,27 @@
 
 ## pg_dump_wrapper.sh
 
+### 2.3.0 (2026-11-21)
+
+**Added**
+- `--servers FILE` (config `servers_file=` / `servers-file=`): back up several servers one after another in one
+  run. Each line is `host,port,user,databases`; `databases` is `all` or a comma list. Empty `user`/`databases`
+  fields use the usual `-U` / `-d` / `--all`. Blank lines, `#` comments, extra spaces and CRLF files are fine.
+- Each server writes into its own folder `OUTPUT_DIR/<host>_<port>/` (safe for Linux and Windows file names), so
+  the same database name on two servers never collides. Retention, `--verify`, `--checksum`, `--table-sizes` and
+  `--per-table` work per server.
+- One log and one combined summary with `host:port/db` (or `host:port/db:schema.table`) rows, and one combined
+  alert. A server that is down or can't be listed is a `FAIL(2) precheck` row and the others still run (unless
+  `--stop-on-error`, which marks the rest `SKIPPED`). The exit code is the worst of all rows.
+- `--dry-run` lists each server, its folder and its commands.
+- Invalid servers-file lines (missing host, bad port, no databases, duplicate `host:port`) stop the run before
+  anything is dumped, with the line number.
+
+**Changed**
+- With `--servers`, passwords come from `.pgpass` / `--pgpassfile` only: `-W` is an error, and so are `-h`/`-p` on
+  the command line (the file sets them). Without `--servers`, `-W` prompts exactly as before.
+- Alerts list every server in the run; the JSON `server` field is a comma-separated `host:port` list with `--servers`.
+
 ### 2.2.0 (2026-11-21)
 
 **Added**
