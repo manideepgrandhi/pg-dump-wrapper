@@ -18,7 +18,8 @@
 #   130  interrupted (INT/TERM)
 #
 # Passwords are NEVER accepted on the command line. Use ~/.pgpass, PGPASSFILE
-# (or the pgpassfile= config key), the PGPASSWORD environment variable, or -W to prompt.
+# (or the pgpassfile= config key), the PGPASSWORD environment variable, or -W to prompt
+# once at the start (the answer is kept in memory for this run only).
 #
 # Runs on Linux and on Windows under Git Bash / MSYS2 / Cygwin (with the native
 # Windows PostgreSQL client tools): CRLF output from psql.exe etc. is handled and
@@ -37,6 +38,7 @@ readonly CR=$'\r'                                 # Windows tools end lines with
 readonly WINDOWS_UNAME_RE='^(MINGW|MSYS|CYGWIN)'   # `uname -s` prefixes of Windows bash ports
 readonly WINDOWS_EXE_SUFFIX=".exe"
 readonly CHECKSUM_BITS=256                         # SHA-256 (sha256sum, or shasum -a 256)
+readonly TTY_DEVICE="/dev/tty"                     # where -W reads the password from
 IS_WINDOWS=0
 _uname="$(uname -s 2>/dev/null || true)"
 [[ "${_uname//$CR/}" =~ $WINDOWS_UNAME_RE ]] && IS_WINDOWS=1
@@ -150,7 +152,8 @@ Connection:
   -h, --host HOST              Server host or socket dir          (default: \$PGHOST or localhost)
   -p, --port PORT              Server port                        (default: \$PGPORT or 5432)
   -U, --user USER              Database user                      (default: \$PGUSER or \$USER)
-  -W, --password               Prompt for password (interactive only; default never prompts)
+  -W, --password               Prompt once for the password at the start (needs a terminal);
+                               it is used for every database and never stored or logged
       --pgpassfile FILE        Use this .pgpass file (sets PGPASSFILE)
 
 Databases (each database gets its own dump file):
@@ -589,6 +592,30 @@ validate() {
 }
 
 # ----------------------------------------------------------------------------
+# -W: ask once, here, instead of letting each tool prompt. Native Windows tools
+# cannot prompt in Git Bash/mintty, and pg_dump runs in the background anyway.
+# The password is exported as PGPASSWORD for this process and its children only.
+# ----------------------------------------------------------------------------
+prompt_password() {
+    (( PROMPT_PASSWORD )) || return 0
+    local ttyfd pw=""
+    if ! { exec {ttyfd}<>"$TTY_DEVICE"; } 2>/dev/null; then
+        die 1 "-W needs a terminal to type the password, but none is available (cron/Task Scheduler?)." \
+            "Use ~/.pgpass (%APPDATA%\\postgresql\\pgpass.conf on Windows) or --pgpassfile instead."
+    fi
+    printf 'Password for user %s@%s:%s: ' "$DB_USER" "$DB_HOST" "$DB_PORT" >&"$ttyfd"
+    IFS= read -r -s -u "$ttyfd" pw || true
+    printf '\n' >&"$ttyfd"
+    exec {ttyfd}>&-
+    pw="${pw%"$CR"}"
+    [[ -n "$pw" ]] || die 1 "No password entered (-W). Run again and type the password, or use ~/.pgpass / --pgpassfile."
+    export PGPASSWORD="$pw"
+    pw=""
+    log_debug "Password read from the terminal (-W); it will be used for every connection in this run"
+    return 0
+}
+
+# ----------------------------------------------------------------------------
 # Database list (--all)
 # ----------------------------------------------------------------------------
 resolve_databases() {
@@ -666,7 +693,7 @@ build_command() {
     CMD=("$(bin pg_dump)"
          --host="$DB_HOST" --port="$DB_PORT" --username="$DB_USER" --dbname="$DB_NAME"
          --format="$FORMAT" --file="$(native_path "$OUTPUT_PATH")")
-    if (( PROMPT_PASSWORD )); then CMD+=(--password); else CMD+=(--no-password); fi
+    CMD+=(--no-password)   # never let pg_dump prompt; -W is answered once by prompt_password
     [[ -n "$COMPRESS" ]] && CMD+=(--compress="$COMPRESS")
     (( JOBS > 1 )) && CMD+=(--jobs="$JOBS")
     (( SCHEMA_ONLY )) && CMD+=(--schema-only)
@@ -722,7 +749,6 @@ global_prechecks() {   # once per run
 db_prechecks() {       # once per database (runs in the per-db child)
     (( SKIP_PRECHECK )) && return 0
     command -v "$(bin psql)" >/dev/null 2>&1 || return 0
-    (( PROMPT_PASSWORD )) && return 0
     local out server_ver db_size_bytes client_major server_major free_kb
     if ! out="$("$(bin psql)" -X -w -At -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
             -c "SELECT current_setting('server_version_num') || '|' || pg_database_size(current_database())" 2>&1)"; then
@@ -1025,6 +1051,7 @@ send_alerts() {   # send_alerts <rc> [test]  -- never fails, never changes the e
 on_exit() {
     local rc=$?
     (( IS_CHILD )) && return 0
+    (( PROMPT_PASSWORD )) && unset PGPASSWORD
     trap - EXIT INT TERM
     set +e
     (( MAIN_STARTED )) || exit "$rc"
@@ -1084,6 +1111,7 @@ main() {
 
     if (( DRY_RUN )); then
         prepare_output_dir
+        (( ALL_DBS )) && prompt_password   # --all must connect to list the databases
         resolve_databases
         log_info "DRY RUN - pg_dump would be executed as:"
         local db
@@ -1096,6 +1124,7 @@ main() {
         exit 0
     fi
 
+    prompt_password
     prepare_output_dir
     trap 'on_signal INT' INT
     trap 'on_signal TERM' TERM

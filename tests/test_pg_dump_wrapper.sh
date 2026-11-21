@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016  # bash -c '...' snippets get their values as $1, $2
 #
 # End-to-end tests for pg_dump_wrapper.sh against a throwaway PostgreSQL cluster.
 #
@@ -40,7 +41,7 @@ cleanup() {
     if [[ "${PDW_KEEP:-0}" == 1 ]]; then echo "kept $T"; else rm -rf -- "$T"; fi
 }
 trap cleanup EXIT
-cd "$T"   # relative paths (e.g. a Windows path an old version does not understand) land in the temp dir
+cd "$T" || exit 2   # relative paths (e.g. a Windows path an old version does not understand) land in the temp dir
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
@@ -278,6 +279,60 @@ check "no cygpath: pg_dump gets --file=C:/backups/..." has "--file=C:/backups/ab
 
 run "PATH=$NOCYG:$PATH" -- -h 127.0.0.1 -p "$PORT" -d abc -o '/c/backups' --pg-bin "$CLIENT_BIN" --dry-run
 check "no cygpath: /c/backups -> --file=C:/backups/..." has "--file=C:/backups/abc_"
+
+# ----------------------------------------------------------------------------
+section "-W: one prompt from the terminal (driven through a pty with script(1))"
+P="$T/prompt"; mkdir -p "$P"
+NOPASS=(-h 127.0.0.1 -p "$PORT" -U "$PGUSER_T" --min-free-mb 1)
+RUNTTY_ENV=()
+runtty() {   # runtty <typed-password> wrapper-args... ; pty transcript in $OUT
+    local typed="$1"; shift
+    local cmd; cmd="$(printf '%q ' env PGPASSFILE="$T/no-such-pgpass" PGPASSWORD= "${RUNTTY_ENV[@]}" bash "$WRAPPER" "$@")"
+    OUT="$( { sleep 1; printf '%s\n' "$typed"; } | script -qefc "$cmd" /dev/null 2>&1)"; RC=$?
+}
+prompts() { grep -o "Password for user" <<<"$OUT" | wc -l; }
+
+runtty "$PASSWORD_T" "${NOPASS[@]}" -W -d abc -o "$P/one"
+check "-W -d abc exits 0" test "$RC" -eq 0
+check "-W -d abc wrote the dump" test "$(count_files "$P/one" 'abc_*.dump')" -eq 1
+check "-W runs the connection pre-check" has "Connected: server_version_num="
+
+runtty "$PASSWORD_T" "${NOPASS[@]}" -W --all -o "$P/all" --verify --checksum
+check "-W --all exits 0" test "$RC" -eq 0
+check "-W --all dumps 5 databases" test "$(count_files "$P/all" '*.dump')" -eq 5
+check "-W --all prompts exactly once" test "$(prompts)" -eq 1
+check "password not echoed on the terminal or in output" hasnt "$PASSWORD_T"
+
+runtty "$PASSWORD_T" "${NOPASS[@]}" -W -d abc,chatagent,invent -o "$P/multi"
+check "-W with 3 databases prompts exactly once" test "$(prompts)" -eq 1 -a "$(count_files "$P/multi" '*.dump')" -eq 3
+check "pg_dump gets --no-password, not --password" bash -c 'grep -q -- "--no-password" <<<"$1" && ! grep -q -- " --password" <<<"$1"' _ "$OUT"
+
+check "password not in any log file" bash -c "! grep -rqF -- '$PASSWORD_T' '$P'/*/pg_dump_wrapper.log"
+
+runtty "wrong_$PASSWORD_T" "${NOPASS[@]}" -W -d abc -o "$P/wrong"
+check "wrong password -> exit 2" test "$RC" -eq 2
+check "wrong password -> authentication error shown" has "password authentication failed"
+check "wrong password -> no dump left" test "$(count_files "$P/wrong" '*.dump')" -eq 0
+
+runtty "wrong_$PASSWORD_T" "${NOPASS[@]}" -W --all -o "$P/wrongall"
+check "wrong password with --all -> exit 2, clean message" bash -c '[[ $1 -eq 2 ]] && grep -q "Cannot list databases" <<<"$2"' _ "$RC" "$OUT"
+
+runtty "" "${NOPASS[@]}" -W -d abc -o "$P/empty"
+check "empty password -> exit 1 with message" bash -c '[[ $1 -eq 1 ]] && grep -q "No password entered" <<<"$2"' _ "$RC" "$OUT"
+
+OUT="$(PGPASSFILE="$T/no-such-pgpass" setsid bash "$WRAPPER" "${NOPASS[@]}" -W -d abc -o "$P/notty" </dev/null 2>&1)"; RC=$?
+check "no terminal -> exit 1" test "$RC" -eq 1
+check "no terminal -> points to pgpass" has "-W needs a terminal"
+
+runtty "$PASSWORD_T" "${NOPASS[@]}" -W -d abc -o "$P/dry" --dry-run
+check "-W dry-run for -d does not prompt" test "$(prompts)" -eq 0
+runtty "$PASSWORD_T" "${NOPASS[@]}" -W --all -o "$P/dryall" --dry-run
+check "-W dry-run --all prompts once and lists 5" bash -c '[[ $1 -eq 0 ]] && [[ $(grep -c -- "--file=" <<<"$2") -eq 5 ]]' _ "$RC" "$OUT"
+
+RUNTTY_ENV=("${WENV[@]}")
+runtty "$PASSWORD_T" "${NOPASS[@]}" --pg-bin "$WINBIN_WIN" -W --all -o 'C:\wprompt'
+RUNTTY_ENV=()
+check "-W --all with simulated Windows tools" test "$RC" -eq 0 -a "$(count_files "$DRIVES/c/wprompt" '*.dump')" -eq 5
 
 # ----------------------------------------------------------------------------
 section "Static checks"

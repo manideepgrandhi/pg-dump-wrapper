@@ -15,7 +15,7 @@ A matching `pg_restore` wrapper is planned and not in this repository yet. Until
 
 - **Bash 4.4+**, plus the PostgreSQL client binaries (`--pg-bin DIR` to choose a version, e.g. `/usr/lib/postgresql/17/bin`).
 - **Settings precedence:** built-in defaults → `--config FILE` (plain `key=value`, parsed, never executed, unknown keys rejected) → command line.
-- **Connection:** `-h/--host`, `-p/--port` (default `$PGPORT`, otherwise 5432; config `port=`), `-U/--user`. **Passwords are never accepted on the command line or in config files.** Use `~/.pgpass`, `--pgpassfile`/`PGPASSFILE`, `PGPASSWORD`, or a `-W` prompt. Every call uses `--no-password`, so cron jobs fail fast instead of hanging.
+- **Connection:** `-h/--host`, `-p/--port` (default `$PGPORT`, otherwise 5432; config `port=`), `-U/--user`. **Passwords are never accepted on the command line or in config files.** Use `~/.pgpass`, `--pgpassfile`/`PGPASSFILE`, `PGPASSWORD`, or a one-time `-W` prompt. Every call uses `--no-password`, so cron jobs fail fast instead of hanging.
 - **Many databases:** `-d a,b,c` or `--all --exclude-db 'glob'`. Each database is isolated, the run ends with a summary table, and the exit code is the highest code of any database.
 - **Dry run:** `--dry-run` prints exactly what would run and changes nothing.
 - **Alerts:** `--alert-email`, `--alert-webhook` (Slack/Teams/Google Chat or structured JSON), `--alert-on`, `--alert-test`. Webhook tokens are never logged, and alerts never change the exit code.
@@ -50,7 +50,7 @@ Settings are applied in this order (later ones win): **built-in defaults → `--
 | `-h, --host HOST` | `--host` | Server hostname or Unix socket directory. Default: `$PGHOST`, otherwise `localhost`. (`-h` means host here, just like in pg_dump. Use `--help` for help.) |
 | `-p, --port PORT` | `--port` | Server port. Default: `$PGPORT`, otherwise `5432`. |
 | `-U, --user USER` | `--username` | Role to connect as. Default: `$PGUSER`, otherwise `$USER`. |
-| `-W, --password` | `--password` | Forces a password prompt (interactive use only). Without it the wrapper passes `--no-password`, so cron jobs fail fast instead of hanging. |
+| `-W, --password` | (none) | The wrapper asks for the password **once** at the start (typing is hidden) and uses it for the `--all` listing, the pre-checks and every database. It's kept in memory for that run only (as `PGPASSWORD` for the wrapper and its child tools) and never logged. Needs a terminal: without one (cron, Task Scheduler) the run stops with exit code 1 and asks you to use `~/.pgpass` or `--pgpassfile`. Works in Git Bash, where `pg_dump.exe` can't prompt by itself. pg_dump always gets `--no-password`. |
 | `--pgpassfile FILE` | env `PGPASSFILE` | Reads the password from this `.pgpass` file. |
 
 **Passwords are never accepted on the command line**, because other users can see command arguments in `ps`. Use `~/.pgpass` (chmod 600), `--pgpassfile`, or the `PGPASSWORD` environment variable. The wrapper never prints or logs the password.
@@ -302,6 +302,7 @@ client tools, for example the ones that ship with pgAdmin or the EDB installer.
 - The same applies to `--log-file`, `--pg-bin`, `--pgpassfile`, `--config`, and the matching config keys.
   Paths are converted with `cygpath` (falls back to `C:\x` → `/c/x` when `cygpath` is missing), and
   `pg_dump.exe` / `pg_restore.exe` and `PGPASSFILE` get the `C:/...` form that Windows programs understand.
+- `-W` works here too: the wrapper itself asks for the password once (Windows `pg_dump.exe`/`psql.exe` can't prompt inside Git Bash's terminal).
 - The CRLF line endings that `psql.exe` / `pg_dump.exe` print are stripped everywhere, so `--all`,
   the version check and database sizes work the same as on Linux.
 - On Windows the libpq password file is `%APPDATA%\postgresql\pgpass.conf` (not `~/.pgpass`), or use `--pgpassfile`.

@@ -89,7 +89,11 @@ PGPASSWORD="$DB_PASSWORD" ./pg_dump_wrapper.sh -h db01.example.com -U backup_use
 ```bash
 ./pg_dump_wrapper.sh -h db01.example.com -U backup_user -d salesdb -o /backups -W
 ```
-**Notes:** pg_dump asks for the password. The psql connectivity pre-check is skipped in this mode (pg_isready still runs). Don't use `-W` in cron.
+**Notes:** the wrapper asks `Password for user backup_user@db01.example.com:5432:` once, with hidden typing, and uses that answer for every database, the `--all` listing and the pre-checks. The password stays in memory for this run only and is never written to the log, the printed command or alerts. This also works in Git Bash on Windows. Don't use `-W` in cron or Task Scheduler: with no terminal the run stops at once (exit code 1) with a message pointing to `~/.pgpass` / `--pgpassfile`.
+
+```bash
+./pg_dump_wrapper.sh -h db01.example.com -U backup_user --all -o /backups -W   # one prompt for all databases
+```
 
 ---
 
