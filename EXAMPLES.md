@@ -1,4 +1,4 @@
-# pg_dump_wrapper.sh: usage examples (v2.0.0)
+# pg_dump_wrapper.sh: usage examples (v2.0.1)
 
 These are copy-paste recipes for every feature of `pg_dump_wrapper.sh`. Each example has
 **when to use it**, **the command**, and **what you get**. Where it makes sense, there's also the matching **restore** command.
@@ -31,6 +31,7 @@ Replace them with your own values.
 20. [Calling the wrapper from another script (exit codes)](#20-calling-the-wrapper-from-another-script-exit-codes)
 21. [Common errors and what you'll see](#21-common-errors-and-what-youll-see)
 22. [Restore recipes](#22-restore-recipes)
+23. [Windows (Git Bash)](#23-windows-git-bash)
 
 ---
 
@@ -869,3 +870,54 @@ done
 ```bash
 cd /backups && sha256sum -c salesdb_20261010_013000.dump.sha256 && pg_restore -d salesdb_restored salesdb_20261010_013000.dump
 ```
+
+---
+
+## 23. Windows (Git Bash)
+
+**When:** you run the wrapper on a Windows laptop or server in Git Bash with the Windows PostgreSQL tools
+(pgAdmin's `runtime` folder or the EDB installer's `bin` folder). See [README: Windows (Git Bash)](README.md#windows-git-bash).
+
+### 23.1 Back up every database to `C:\backups`
+```bash
+./pg_dump_wrapper.sh -h localhost -U postgres --all \
+  --pg-bin 'C:/Program Files/pgAdmin 4/runtime' -o 'C:\backups'
+```
+**You get:** one `<db>_YYYYmmdd_HHMMSS.dump` per database in `C:\backups`, plus `C:\backups\pg_dump_wrapper.log`.
+
+### 23.2 Path styles that work
+```bash
+-o 'C:\backups'     # quoted backslashes
+-o "C:\backups"     # double quotes work too
+-o C:/backups       # forward slashes need no quotes
+-o /c/backups       # Git Bash style
+```
+Unquoted `-o C:\backups` arrives as `C:backups` (bash removed the backslash). The wrapper logs a warning and
+uses `C:\backups`, but a deeper unquoted path such as `C:\data\pg` can't be recovered, so always quote.
+
+### 23.3 Password file on Windows
+```bash
+./pg_dump_wrapper.sh -h db01.example.com -U backup_user -d salesdb \
+  --pgpassfile 'C:\Users\backup_user\AppData\Roaming\postgresql\pgpass.conf' -o 'D:\pg backups'
+```
+
+### 23.4 Verify and checksum
+```bash
+./pg_dump_wrapper.sh -h localhost -U postgres -d salesdb -o 'C:\backups' --verify --checksum
+cd /c/backups && sha256sum -c salesdb_20261010_013000.dump.sha256
+```
+
+### 23.5 Config file with Windows paths
+```ini
+# C:\pgbackup\pg_dump_wrapper.conf  (CRLF line endings are fine)
+host=localhost
+user=postgres
+all=yes
+output_dir=C:\backups
+pg_bin=C:\Program Files\pgAdmin 4\runtime
+```
+```bash
+./pg_dump_wrapper.sh --config 'C:\pgbackup\pg_dump_wrapper.conf'
+```
+Config values are read literally, so backslashes need no quoting inside the file.
+

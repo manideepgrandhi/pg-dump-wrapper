@@ -6,7 +6,7 @@ Cron-friendly Bash wrappers around the PostgreSQL client tools. They add safe de
 
 | Tool | Version | What it does | Docs |
 |---|---|---|---|
-| [`pg_dump_wrapper.sh`](pg_dump_wrapper.sh) | 2.0.0 | Backups with `pg_dump`: every format, one/many/all databases, verification, sha256 checksums, retention, alerts | [README](#pg_dump_wrappersh) (below) · [Examples](EXAMPLES.md) · [Why this wrapper](WHY_THIS_WRAPPER.md) · [Sample config](pg_dump_wrapper.conf.example) |
+| [`pg_dump_wrapper.sh`](pg_dump_wrapper.sh) | 2.0.1 | Backups with `pg_dump`: every format, one/many/all databases, verification, sha256 checksums, retention, alerts | [README](#pg_dump_wrappersh) (below) · [Examples](EXAMPLES.md) · [Why this wrapper](WHY_THIS_WRAPPER.md) · [Sample config](pg_dump_wrapper.conf.example) |
 | [`psql_wrapper.sh`](psql_wrapper.sh) | 1.0.0 | One tool, three commands: `migrate` (transactional, tracked SQL migrations with a production guard), `query` (CSV/TSV/JSON/NDJSON exports and scheduled reports), `health` (sizes, connections, locks, long queries, bloat, replication, cache, vacuum, wraparound with WARN/CRIT thresholds) | [README](README_psql.md) · [Examples](EXAMPLES_psql.md) · [Why this wrapper](WHY_PSQL_WRAPPER.md) · [Sample config](psql_wrapper.conf.example) |
 
 A matching `pg_restore` wrapper is planned and not in this repository yet. Until then, restore with the `pg_restore` / `psql` commands shown in [EXAMPLES.md](EXAMPLES.md).
@@ -34,7 +34,7 @@ alerts, so one command (or one cron line) produces reliable, consistently named 
 pg_dump_wrapper.sh (-d DB[,DB...] | --all) [options] [-- extra pg_dump args]
 ```
 
-Version 2.0.0. Needs Bash 4.4 or newer.
+Version 2.0.1. Needs Bash 4.4 or newer. Runs on Linux and on Windows in Git Bash (see [Windows (Git Bash)](#windows-git-bash)). Changes: [CHANGELOG.md](CHANGELOG.md).
 
 📘 **For copy-paste recipes for every scenario (formats, filters, migration, multiple databases, alerts, cron/systemd, exit codes, errors, restores), see [EXAMPLES.md](EXAMPLES.md).**
 
@@ -289,6 +289,28 @@ alert_webhook_format=slack          # slack ({"text": ...}) | json (structured)
 ```
 Boolean keys accept `yes/no`, `true/false`, `1/0`, and `on/off`. In list keys (`dbnames`, `exclude_db`, `schemas`, `exclude_schemas`, `tables`, `exclude_tables`, `exclude_table_data`, `alert_email`, `alert_webhook`), a CLI value **replaces** the config list instead of adding to it. Other alert keys: `alert_on`, `alert_webhook_format`, `alert_from`. Database keys: `all`, `exclude_db`, `maintenance_db`, `stop_on_error`. A `-d` on the command line overrides `all=yes` from the config, and `--all` overrides `dbnames=`.
 
+## Windows (Git Bash)
+
+`pg_dump_wrapper.sh` runs in Git Bash (also MSYS2 and Cygwin) with the native Windows PostgreSQL
+client tools, for example the ones that ship with pgAdmin or the EDB installer.
+
+- **Point `--pg-bin` at the Windows tools**, or put that folder on `PATH`. `pg_dump.exe` is found as `pg_dump`.
+- **Quote Windows paths.** Bash removes backslashes from unquoted words, so `-o c:\backups` reaches the
+  script as `c:backups`. The script warns about this and still uses `C:` + `backups`, but for any deeper
+  path (`c:\data\pg` would become `c:datapg`) only the quoted form is correct. All of these work:
+  `-o 'C:\backups'`, `-o "C:\backups"`, `-o C:/backups`, `-o /c/backups`.
+- The same applies to `--log-file`, `--pg-bin`, `--pgpassfile`, `--config`, and the matching config keys.
+  Paths are converted with `cygpath` (falls back to `C:\x` → `/c/x` when `cygpath` is missing), and
+  `pg_dump.exe` / `pg_restore.exe` and `PGPASSFILE` get the `C:/...` form that Windows programs understand.
+- The CRLF line endings that `psql.exe` / `pg_dump.exe` print are stripped everywhere, so `--all`,
+  the version check and database sizes work the same as on Linux.
+- On Windows the libpq password file is `%APPDATA%\postgresql\pgpass.conf` (not `~/.pgpass`), or use `--pgpassfile`.
+
+```bash
+./pg_dump_wrapper.sh -h localhost -U postgres --all \
+  --pg-bin 'C:/Program Files/pgAdmin 4/runtime' -o 'C:\backups' --verify --checksum
+```
+
 ## Notes and caveats
 - Needs Bash ≥ 4.4 (5.x recommended), `pg_dump`, and `pg_restore`. `psql` and `pg_isready` are recommended for pre-checks, and `psql` is required for `--all`.
 - `-d` must be a plain database name (not a `postgresql://` URI), because it's also used in the file name.
@@ -300,3 +322,4 @@ Boolean keys accept `yes/no`, `true/false`, `1/0`, and `on/off`. In list keys (`
 - Retention uses file modification time (`find -mtime +N`) and only deletes entries matching the wrapper's own naming pattern.
 - `--clean` and `--create` only change the SQL in **plain** dumps. For custom/dir/tar dumps, pass them to `pg_restore`.
 - pg_dump takes a consistent snapshot but doesn't include roles or tablespaces. Use `pg_dumpall --globals-only` for those.
+- Tests: `PDW_SERVER_BIN=/usr/lib/postgresql/16/bin tests/test_pg_dump_wrapper.sh` starts a throwaway cluster, runs the Linux and simulated-Windows checks, then stops it and removes its temp dir.

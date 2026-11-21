@@ -1,0 +1,2 @@
+2026-11-21 12:02:17 [ERROR] pgpassfile not readable: C:\Users\me\pg pass\pgpass.conf
+2026-11-21 12:02:17 [ERROR] Run finished with exit code 1 (stage: validate)
