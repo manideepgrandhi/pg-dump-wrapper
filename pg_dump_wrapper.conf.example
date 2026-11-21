@@ -17,6 +17,7 @@ dbnames=salesdb,hrdb
 # exclude_db=postgres,test_*        # globs, only used with all=yes
 # maintenance_db=postgres           # where the database list is read from
 stop_on_error=no                    # yes = stop at the first failed database
+table_sizes=10                      # list the N largest tables before each dump (0 = off, all = every table)
 
 # --- format ------------------------------------------------------------------
 format=directory          # plain | custom | directory | tar

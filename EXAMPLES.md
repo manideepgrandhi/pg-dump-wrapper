@@ -1,4 +1,4 @@
-# pg_dump_wrapper.sh: usage examples (v2.0.1)
+# pg_dump_wrapper.sh: usage examples (v2.1.0)
 
 These are copy-paste recipes for every feature of `pg_dump_wrapper.sh`. Each example has
 **when to use it**, **the command**, and **what you get**. Where it makes sense, there's also the matching **restore** command.
@@ -32,6 +32,7 @@ Replace them with your own values.
 21. [Common errors and what you'll see](#21-common-errors-and-what-youll-see)
 22. [Restore recipes](#22-restore-recipes)
 23. [Windows (Git Bash)](#23-windows-git-bash)
+24. [Table-size report (`--table-sizes`)](#24-table-size-report---table-sizes)
 
 ---
 
@@ -924,4 +925,44 @@ pg_bin=C:\Program Files\pgAdmin 4\runtime
 ./pg_dump_wrapper.sh --config 'C:\pgbackup\pg_dump_wrapper.conf'
 ```
 Config values are read literally, so backslashes need no quoting inside the file.
+
+---
+
+## 24. Table-size report (`--table-sizes`)
+
+**When:** you want to see what's big before a dump (to plan disk space or spot a runaway table). It's on by default and lists the top 10 tables.
+
+### 24.1 Default (top 10 per database)
+```bash
+./pg_dump_wrapper.sh -h db01.example.com -U backup_user -d salesdb -o /backups
+```
+**You get**, before the dump:
+```
+[INFO] [abc] Largest tables: top 3 of 12 (size incl. indexes and TOAST; rows are estimates)
+[INFO] [abc]   TABLE              TOTAL SIZE       EST. ROWS
+[INFO] [abc]   sales.orders           984 kB            5000
+[INFO] [abc]   public.t_abc           144 kB            1000
+[INFO] [abc]   sales.MixedCase    8192 bytes               3
+```
+
+### 24.2 More, all, or none
+```bash
+./pg_dump_wrapper.sh -d salesdb -o /backups --table-sizes 25    # top 25
+./pg_dump_wrapper.sh -d salesdb -o /backups --table-sizes all   # every table
+./pg_dump_wrapper.sh -d salesdb -o /backups --table-sizes 0     # off
+```
+In a config file: `table_sizes=25` (or `table-sizes=25`).
+
+### 24.3 Only the tables you dump
+```bash
+./pg_dump_wrapper.sh -d salesdb -o /backups -t 'sales.order*'
+./pg_dump_wrapper.sh -d salesdb -o /backups -- --table='sales."Customers"'
+```
+**You get:** `Largest tables matching -t sales.order*: all 2 ...`. Only matching tables are listed, and the dump itself is unchanged.
+
+### 24.4 Preview sizes without dumping
+```bash
+./pg_dump_wrapper.sh -d salesdb,hrdb -o /backups --dry-run --table-sizes all
+```
+The dry run connects to read the sizes. If it can't (no password, server down), it logs a warning and still prints the commands.
 

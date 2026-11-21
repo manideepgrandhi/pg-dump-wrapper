@@ -2,6 +2,20 @@
 
 ## pg_dump_wrapper.sh
 
+### 2.1.0 (2026-11-21)
+
+**Added**
+- Table-size report before each database's dump: `schema.table`, total size including indexes and TOAST,
+  and estimated rows (`reltuples`; `-` if never analyzed), largest first. It goes to the screen and the log,
+  and is also shown in `--dry-run`.
+- `--table-sizes N|all` and config key `table_sizes=` (also `table-sizes=`). Default 10; `0` = off; `all` = every table.
+- With `-t`/`--table` (wrapper option or after `--`), only the matching tables are listed (`*`/`?` wildcards,
+  quoted names, `schema.table`).
+- System schemas (`pg_*`, `information_schema`) are excluded. CRLF output from Windows `psql.exe` is handled.
+- The report never fails a run: with `--skip-precheck`, no `psql`, or a failing query it logs a warning instead.
+- Config keys may now be written with `-` or `_` (`table-sizes` = `table_sizes`).
+- With `-W`, `--dry-run` asks for the password when it needs to connect (for `--all` or the table-size report).
+
 ### 2.0.1 (2026-11-21)
 
 Windows (Git Bash / MSYS2 / Cygwin) support. Behaviour on Linux is unchanged.

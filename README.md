@@ -6,7 +6,7 @@ Cron-friendly Bash wrappers around the PostgreSQL client tools. They add safe de
 
 | Tool | Version | What it does | Docs |
 |---|---|---|---|
-| [`pg_dump_wrapper.sh`](pg_dump_wrapper.sh) | 2.0.1 | Backups with `pg_dump`: every format, one/many/all databases, verification, sha256 checksums, retention, alerts | [README](#pg_dump_wrappersh) (below) · [Examples](EXAMPLES.md) · [Why this wrapper](WHY_THIS_WRAPPER.md) · [Sample config](pg_dump_wrapper.conf.example) |
+| [`pg_dump_wrapper.sh`](pg_dump_wrapper.sh) | 2.1.0 | Backups with `pg_dump`: every format, one/many/all databases, verification, sha256 checksums, retention, alerts | [README](#pg_dump_wrappersh) (below) · [Examples](EXAMPLES.md) · [Why this wrapper](WHY_THIS_WRAPPER.md) · [Sample config](pg_dump_wrapper.conf.example) |
 | [`psql_wrapper.sh`](psql_wrapper.sh) | 1.0.0 | One tool, three commands: `migrate` (transactional, tracked SQL migrations with a production guard), `query` (CSV/TSV/JSON/NDJSON exports and scheduled reports), `health` (sizes, connections, locks, long queries, bloat, replication, cache, vacuum, wraparound with WARN/CRIT thresholds) | [README](README_psql.md) · [Examples](EXAMPLES_psql.md) · [Why this wrapper](WHY_PSQL_WRAPPER.md) · [Sample config](psql_wrapper.conf.example) |
 
 A matching `pg_restore` wrapper is planned and not in this repository yet. Until then, restore with the `pg_restore` / `psql` commands shown in [EXAMPLES.md](EXAMPLES.md).
@@ -34,7 +34,7 @@ alerts, so one command (or one cron line) produces reliable, consistently named 
 pg_dump_wrapper.sh (-d DB[,DB...] | --all) [options] [-- extra pg_dump args]
 ```
 
-Version 2.0.1. Needs Bash 4.4 or newer. Runs on Linux and on Windows in Git Bash (see [Windows (Git Bash)](#windows-git-bash)). Changes: [CHANGELOG.md](CHANGELOG.md).
+Version 2.1.0. Needs Bash 4.4 or newer. Runs on Linux and on Windows in Git Bash (see [Windows (Git Bash)](#windows-git-bash)). Changes: [CHANGELOG.md](CHANGELOG.md).
 
 📘 **For copy-paste recipes for every scenario (formats, filters, migration, multiple databases, alerts, cron/systemd, exit codes, errors, restores), see [EXAMPLES.md](EXAMPLES.md).**
 
@@ -63,6 +63,7 @@ Settings are applied in this order (later ones win): **built-in defaults → `--
 | `--exclude-db PAT` | With `--all`, skips databases matching a shell glob (`postgres`, `test_*`). Can be repeated or comma-separated. |
 | `--maintenance-db DB` | Database that `--all` connects to in order to list databases. Default: `postgres`. |
 | `--stop-on-error` | Stops at the first database that fails and marks the rest `SKIPPED`. By default the script **continues** with the remaining databases. |
+| `--table-sizes N\|all` | Before each database's dump, lists its **N largest tables**: `schema.table`, total size including indexes and TOAST, and estimated rows (`reltuples`, `-` if never analyzed), largest first. `0` turns it off, `all` lists every table. System schemas are left out. With `-t`/`--table` (wrapper option or after `--`) only the matching tables are listed. Default: `10` (config `table_sizes=` or `table-sizes=`). |
 
 Each database runs in its own child process, with its own pre-check, dump, verify, checksum, and retention. One database failing never removes another database's output. At the end the script logs a summary table like this:
 
@@ -73,6 +74,22 @@ lockeddb                 FAIL(2)   precheck   -        0m00s    -
 salesdb                  OK        -          4.5M     0m01s    /backups/salesdb_20261010_013001.dump
 ```
 The overall exit code is 0 only if every database succeeded. Otherwise it's the **highest** exit code of any failed database. All databases share one log file, and each line is tagged `[dbname]`.
+
+#### Table-size report
+Shown on screen and in the log before each dump, and in `--dry-run` (which then connects to the server):
+
+```
+[INFO] [abc] Largest tables: top 3 of 12 (size incl. indexes and TOAST; rows are estimates)
+[INFO] [abc]   TABLE              TOTAL SIZE       EST. ROWS
+[INFO] [abc]   sales.orders           984 kB            5000
+[INFO] [abc]   public.t_abc           144 kB            1000
+[INFO] [abc]   sales.MixedCase    8192 bytes               3
+```
+
+- Size is `pg_total_relation_size` (table + indexes + TOAST). Rows come from `pg_class.reltuples`, so they're estimates and are only as fresh as the last `ANALYZE`.
+- Only ordinary tables are listed. Each partition shows as its own table.
+- `-t` patterns follow pg_dump's common rules: `*` and `?` are wildcards, unquoted names are lower-cased, `"Quoted"` parts keep their case, and `schema.table` limits the schema. An unqualified name only matches tables visible on the `search_path`, as in pg_dump. Other regex characters (`[ ] + ( )`…) are matched literally here.
+- Skipped with a warning when `--skip-precheck` is used, `psql` is missing, or the query fails (for example, no permission).
 
 ### Format and performance
 | Option | pg_dump flag | Purpose |
@@ -138,6 +155,7 @@ Alerts never change the backup's exit code: a failed e-mail or webhook only logs
 2. Run-level pre-checks: pg_dump exists and its version is logged, `pg_isready` succeeds, and free disk space is checked. With `--all`, the database list is read here.
 3. For each database (in a child process):
    - a `psql` login check, which also logs the server version and DB size and fails if pg_dump is older than the server
+   - the table-size report (`--table-sizes`, default top 10). It never fails the run: if it can't be read, you get a warning
    - pg_dump runs with `--no-password` and its output streams into the log
    - optional verify, then checksum, then retention
 4. If pg_dump fails, or the run is interrupted (Ctrl-C / SIGTERM), pg_dump is stopped and that database's **partial file or directory is removed**. On interrupt, the remaining databases are marked `SKIPPED`.
