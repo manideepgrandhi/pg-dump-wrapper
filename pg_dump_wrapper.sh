@@ -29,7 +29,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="2.0.1"
+readonly SCRIPT_VERSION="2.1.0"
 
 # ----------------------------------------------------------------------------
 # Platform (Windows = Git Bash / MSYS2 / Cygwin; everything else behaves as Linux)
@@ -39,6 +39,8 @@ readonly WINDOWS_UNAME_RE='^(MINGW|MSYS|CYGWIN)'   # `uname -s` prefixes of Wind
 readonly WINDOWS_EXE_SUFFIX=".exe"
 readonly CHECKSUM_BITS=256                         # SHA-256 (sha256sum, or shasum -a 256)
 readonly TTY_DEVICE="/dev/tty"                     # where -W reads the password from
+readonly DEFAULT_TABLE_SIZES=10                    # largest tables listed before each dump (0 = off, all = every table)
+readonly FIELD_SEP=$'\x1f'                         # column separator for psql -A output (never in names)
 IS_WINDOWS=0
 _uname="$(uname -s 2>/dev/null || true)"
 [[ "${_uname//$CR/}" =~ $WINDOWS_UNAME_RE ]] && IS_WINDOWS=1
@@ -94,6 +96,8 @@ ALERT_WEBHOOK_FORMAT="slack"
 ALERT_FROM=""
 ALERT_TEST=0
 ALERT_LOG_LINES=20
+# table-size report
+TABLE_SIZES="$DEFAULT_TABLE_SIZES"
 
 # runtime state (parent)
 DB_NAME=""
@@ -161,6 +165,9 @@ Databases (each database gets its own dump file):
       --all                    Dump every non-template database that allows connections
       --exclude-db PATTERN     With --all: skip databases matching shell glob    [repeatable]
       --maintenance-db DB      Database used to list databases for --all  (default: postgres)
+      --table-sizes N|all      Before each dump, list the N largest tables (size incl. indexes
+                               and TOAST, estimated rows); 0 = off, all = every table.
+                               With -t, only the matching tables are listed   (default: $DEFAULT_TABLE_SIZES)
       --stop-on-error          Stop at the first failed database (default: continue)
 
 Output format:
@@ -365,10 +372,10 @@ load_config() {
         lineno=$((lineno + 1))
         line="${line%$'\r'}"
         [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
-        if [[ ! "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+        if [[ ! "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_-]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
             die 1 "Config $file:$lineno: invalid line (expected key=value)"
         fi
-        key="${BASH_REMATCH[1],,}"
+        key="${BASH_REMATCH[1],,}"; key="${key//-/_}"   # table-sizes == table_sizes
         val="${BASH_REMATCH[2]}"
         if [[ "$val" =~ ^\"([^\"]*)\" || "$val" =~ ^\'([^\']*)\' ]]; then
             val="${BASH_REMATCH[1]}"                       # quoted: take literally
@@ -384,6 +391,7 @@ load_config() {
             all|all_databases)  is_true "$val" && ALL_DBS=1 || ALL_DBS=0 ;;
             exclude_db|exclude_dbs) EXCLUDE_DBS=(); add_list EXCLUDE_DBS "$val" ;;
             maintenance_db)     MAINTENANCE_DB="$val" ;;
+            table_sizes)        TABLE_SIZES="$val" ;;
             stop_on_error)      is_true "$val" && STOP_ON_ERROR=1 || STOP_ON_ERROR=0 ;;
             format)             FORMAT="$val" ;;
             compress)           COMPRESS="$val" ;;
@@ -455,6 +463,7 @@ parse_args() {
             --all)              ALL_DBS=1; cli_all=1; shift ;;
             --exclude-db)       need_arg "$opt" $#; ((cli_X++)) || EXCLUDE_DBS=(); add_list EXCLUDE_DBS "$2"; shift 2 ;;
             --maintenance-db)   need_arg "$opt" $#; MAINTENANCE_DB="$2"; shift 2 ;;
+            --table-sizes)      need_arg "$opt" $#; TABLE_SIZES="$2"; shift 2 ;;
             --stop-on-error)    STOP_ON_ERROR=1; shift ;;
             -W|--password)      PROMPT_PASSWORD=1; shift ;;
             --pgpassfile)       need_arg "$opt" $#; PGPASSFILE_OPT="$2"; shift 2 ;;
@@ -577,6 +586,12 @@ validate() {
     [[ -z "$RETENTION_DAYS" || "$RETENTION_DAYS" =~ ^[0-9]+$ ]] || die 1 "--retention-days must be a non-negative integer"
     [[ -n "$RETENTION_DAYS" ]] && (( RETENTION_DAYS < 1 )) && die 1 "--retention-days must be >= 1 (refusing to delete everything)"
     [[ "$MIN_FREE_MB" =~ ^[0-9]+$ ]] || die 1 "--min-free-mb must be an integer"
+    TABLE_SIZES="${TABLE_SIZES,,}"
+    if [[ "$TABLE_SIZES" =~ ^[0-9]+$ ]]; then
+        TABLE_SIZES=$(( 10#$TABLE_SIZES ))
+    elif [[ "$TABLE_SIZES" != all ]]; then
+        die 1 "--table-sizes must be a number (0 = off) or 'all' (got '$TABLE_SIZES')"
+    fi
 
     [[ -z "$FILE_NAME" || "$FILE_NAME" != */* ]] || die 1 "--file must be a bare file name; use --output-dir for the directory"
     if (( IS_WINDOWS )) && [[ "$FILE_NAME" == *\\* ]]; then
@@ -642,6 +657,124 @@ resolve_databases() {
     done <<<"$out"
     (( ${#DB_NAMES[@]} )) || die 1 "--all matched no databases (after --exclude-db)"
     log_info "Databases selected by --all: ${DB_NAMES[*]}"
+}
+
+# ----------------------------------------------------------------------------
+# Table patterns (-t/--table, from wrapper options and from extra pg_dump args)
+# ----------------------------------------------------------------------------
+# Every -t pattern the user gave, wrapper option or after "--".
+table_patterns() {   # table_patterns -> one pattern per line
+    local i a
+    for a in "${INCLUDE_TABLES[@]}"; do printf '%s\n' "$a"; done
+    for (( i = 0; i < ${#EXTRA_ARGS[@]}; i++ )); do
+        a="${EXTRA_ARGS[$i]}"
+        case "$a" in
+            -t|--table) (( i + 1 < ${#EXTRA_ARGS[@]} )) && { i=$((i + 1)); printf '%s\n' "${EXTRA_ARGS[$i]}"; } ;;
+            --table=*)  printf '%s\n' "${a#--table=}" ;;
+            -t?*)       printf '%s\n' "${a#-t}" ;;
+        esac
+    done
+    return 0
+}
+
+# pg_dump-style pattern -> POSIX regexes in PAT_NSP_RE / PAT_REL_RE (PAT_NSP_RE is
+# empty for an unqualified pattern). Same rules as pg_dump for the common cases:
+# '*' and '?' are wildcards, unquoted names are lower-cased, "Quoted" parts keep
+# their case and are literal, and the first unquoted '.' separates schema and table
+# (db.schema.table keeps the last two parts). Other characters are matched literally.
+PAT_NSP_RE=""; PAT_REL_RE=""
+pattern_to_regexes() {
+    local pat="$1" ch inq=0 i part=""
+    local -a parts=()
+    for (( i = 0; i < ${#pat}; i++ )); do
+        ch="${pat:i:1}"
+        if [[ "$ch" == '"' ]]; then
+            if (( inq )) && [[ "${pat:i+1:1}" == '"' ]]; then part+='"'; i=$((i + 1)); continue; fi
+            inq=$(( 1 - inq )); continue
+        fi
+        if (( !inq )); then
+            case "$ch" in
+                .)   parts+=("$part"); part=""; continue ;;
+                '*') part+='.*'; continue ;;
+                '?') part+='.'; continue ;;
+            esac
+            ch="${ch,,}"
+        fi
+        case "$ch" in
+            [][\\.^\$+\(\)\{\}\|*?]) part+="\\$ch" ;;
+            *) part+="$ch" ;;
+        esac
+    done
+    parts+=("$part")
+    PAT_REL_RE="^(${parts[-1]})\$"
+    if (( ${#parts[@]} >= 2 )); then PAT_NSP_RE="^(${parts[-2]})\$"; else PAT_NSP_RE=""; fi
+}
+
+sql_literal() { local v="${1//\'/\'\'}"; printf "'%s'" "$v"; }
+
+# SQL condition (on pg_class c / pg_namespace n) matching any of the given patterns,
+# or TRUE when there are none. Unqualified patterns only match visible tables, as in pg_dump.
+table_match_sql() {   # table_match_sql PATTERN...
+    (( $# )) || { printf 'TRUE'; return 0; }
+    local pat rows="" nre
+    for pat in "$@"; do
+        pattern_to_regexes "$pat"
+        if [[ -n "$PAT_NSP_RE" ]]; then nre="$(sql_literal "$PAT_NSP_RE")"; else nre="NULL"; fi
+        rows+="${rows:+,}(${nre}::text, $(sql_literal "$PAT_REL_RE")::text)"
+    done
+    printf 'EXISTS (SELECT 1 FROM (VALUES %s) AS p(nre, rre) WHERE c.relname ~ p.rre AND CASE WHEN p.nre IS NULL THEN pg_catalog.pg_table_is_visible(c.oid) ELSE n.nspname ~ p.nre END)' "$rows"
+}
+
+# Ordinary tables outside the system schemas.
+readonly USER_TABLES_SQL="c.relkind = 'r' AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema'"
+
+# ----------------------------------------------------------------------------
+# Table-size report (before each dump). Never fails the run: problems are warnings.
+# ----------------------------------------------------------------------------
+show_table_sizes() {   # uses DB_NAME
+    [[ "$TABLE_SIZES" != 0 ]] || return 0
+    if (( SKIP_PRECHECK )); then log_warn "Table sizes skipped (--skip-precheck)"; return 0; fi
+    command -v "$(bin psql)" >/dev/null 2>&1 || { log_warn "Table sizes skipped: psql not found"; return 0; }
+    local -a pats=()
+    local p limit="" out sql
+    while IFS= read -r p; do [[ -n "$p" ]] && pats+=("$p"); done < <(table_patterns)
+    [[ "$TABLE_SIZES" == all ]] || limit="LIMIT $TABLE_SIZES"
+    sql="SET standard_conforming_strings = on;
+SELECT n.nspname || '.' || c.relname,
+       pg_catalog.pg_size_pretty(pg_catalog.pg_total_relation_size(c.oid)),
+       CASE WHEN c.reltuples < 0 THEN '-' ELSE c.reltuples::bigint::text END,
+       count(*) OVER ()
+FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE $USER_TABLES_SQL AND $(table_match_sql "${pats[@]}")
+ORDER BY pg_catalog.pg_total_relation_size(c.oid) DESC, 1
+$limit"
+    if ! out="$("$(bin psql)" -X -w -q -At -F "$FIELD_SEP" -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+            -c "$sql" 2>&1)"; then
+        strip_cr out
+        log_warn "Table sizes unavailable: ${out//$'\n'/ }"
+        return 0
+    fi
+    strip_cr out
+    local -a names=() sizes=() rows=()
+    local name size est cnt total=0 w=5 i what
+    while IFS="$FIELD_SEP" read -r name size est cnt; do
+        [[ -n "$name" ]] || continue
+        total="$cnt"
+        names+=("$name"); sizes+=("$size"); rows+=("$est")
+        (( ${#name} > w )) && w=${#name}
+    done <<<"$out"
+    if (( ${#pats[@]} )); then what="tables matching -t ${pats[*]}"; else what="tables"; fi
+    if (( ${#names[@]} == 0 )); then log_info "Table sizes: no $what"; return 0; fi
+    if (( ${#names[@]} < total )); then
+        log_info "Largest $what: top ${#names[@]} of $total (size incl. indexes and TOAST; rows are estimates)"
+    else
+        log_info "Largest $what: all $total (size incl. indexes and TOAST; rows are estimates)"
+    fi
+    log_info "$(printf "  %-${w}s  %12s  %14s" "TABLE" "TOTAL SIZE" "EST. ROWS")"
+    for i in "${!names[@]}"; do
+        log_info "$(printf "  %-${w}s  %12s  %14s" "${names[$i]}" "${sizes[$i]}" "${rows[$i]}")"
+    done
+    return 0
 }
 
 # ----------------------------------------------------------------------------
@@ -900,6 +1033,7 @@ dump_one_db() {   # dump_one_db <dbname> <result-file>   (called inside a subshe
     STAGE="precheck"; prepare_output_path
     build_command
     db_prechecks
+    show_table_sizes
     STAGE="dump";      run_dump
     STAGE="verify";    (( VERIFY )) && verify_dump
     STAGE="checksum";  (( CHECKSUM )) && write_checksum
@@ -1111,12 +1245,13 @@ main() {
 
     if (( DRY_RUN )); then
         prepare_output_dir
-        (( ALL_DBS )) && prompt_password   # --all must connect to list the databases
+        # --all and the table-size report must connect
+        if (( ALL_DBS )) || [[ "$TABLE_SIZES" != 0 ]]; then prompt_password; fi
         resolve_databases
         log_info "DRY RUN - pg_dump would be executed as:"
         local db
         for db in "${DB_NAMES[@]}"; do
-            DB_NAME="$db"; prepare_output_path; build_command; print_command
+            DB_NAME="$db"; show_table_sizes; prepare_output_path; build_command; print_command
         done
         DB_NAME=""
         [[ -n "$RETENTION_DAYS" ]] && log_info "DRY RUN - would delete <db>_YYYYmmdd_HHMMSS.* in $OUTPUT_DIR older than $RETENTION_DAYS days"
