@@ -2,6 +2,26 @@
 
 ## pg_dump_wrapper.sh
 
+### 2.2.0 (2026-11-21)
+
+**Added**
+- `--per-table` (config `per_table=yes`): one pg_dump and one file per table, picked with `-t schema.table`
+  (repeatable/comma list, wildcards) and/or `-n SCHEMA` (every table in it). It's an error without `-t`/`-n`,
+  with `-f`, or with `-t`/`-n` after `--`.
+- `--per-table-file-pattern` / `per_table_file_pattern=`: tokens `{db}` `{schema}` `{table}` `{date}` (required)
+  and `{ext}` (appended if missing). Default `{db}_{schema}_{table}_{date}.{ext}`. Names are made safe for
+  Linux and Windows file systems.
+- `--verify`, `--checksum` and retention work per file. Retention only removes older files of the same table.
+- The summary has one `db:schema.table` row per table. A table or schema missing in a database is a
+  `FAIL(2) precheck` row with a clear message. The other tables still run (unless `--stop-on-error`), and the
+  exit code is the worst of all rows.
+- Works with several databases (`-d a,b` / `--all`). The table-size report is shown once per database for the
+  selected tables.
+- `--dry-run` lists one exact `--table="schema"."table"` command per table.
+
+**Changed**
+- Summary column widens for long `db:schema.table` labels.
+
 ### 2.1.0 (2026-11-21)
 
 **Added**

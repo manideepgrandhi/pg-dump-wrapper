@@ -29,7 +29,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 
 # ----------------------------------------------------------------------------
 # Platform (Windows = Git Bash / MSYS2 / Cygwin; everything else behaves as Linux)
@@ -41,6 +41,11 @@ readonly CHECKSUM_BITS=256                         # SHA-256 (sha256sum, or shas
 readonly TTY_DEVICE="/dev/tty"                     # where -W reads the password from
 readonly DEFAULT_TABLE_SIZES=10                    # largest tables listed before each dump (0 = off, all = every table)
 readonly FIELD_SEP=$'\x1f'                         # column separator for psql -A output (never in names)
+readonly FILE_DATE_FORMAT='%Y%m%d_%H%M%S'          # the {date} part of every backup file name
+readonly FILE_DATE_GLOB='[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]'
+readonly DEFAULT_PER_TABLE_FILE_PATTERN='{db}_{schema}_{table}_{date}.{ext}'
+readonly PER_TABLE_REQUIRED_TOKENS=(db schema table date)
+readonly UNSAFE_FILE_CHARS='[/\\:*?"<>|[:cntrl:][:space:]]'   # replaced by _ in per-table file names
 IS_WINDOWS=0
 _uname="$(uname -s 2>/dev/null || true)"
 [[ "${_uname//$CR/}" =~ $WINDOWS_UNAME_RE ]] && IS_WINDOWS=1
@@ -98,6 +103,12 @@ ALERT_TEST=0
 ALERT_LOG_LINES=20
 # table-size report
 TABLE_SIZES="$DEFAULT_TABLE_SIZES"
+# one file per table
+PER_TABLE=0
+PER_TABLE_FILE_PATTERN="$DEFAULT_PER_TABLE_FILE_PATTERN"
+TABLE_SCHEMA=""     # set in a per-table child
+TABLE_NAME=""
+UNIT_LABEL=""       # "db" or "db:schema.table" in results and log lines
 
 # runtime state (parent)
 DB_NAME=""
@@ -126,7 +137,8 @@ _ts() { date '+%Y-%m-%d %H:%M:%S'; }
 _log() {
     local level="$1"; shift
     local line
-    line="$(_ts) [$level]${DB_NAME:+ [$DB_NAME]} $*"
+    local tag="${UNIT_LABEL:-$DB_NAME}"
+    line="$(_ts) [$level]${tag:+ [$tag]} $*"
     printf '%s\n' "$line" >&2
     if [[ -n "$LOG_FILE" && "$DRY_RUN" -eq 0 ]]; then
         printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
@@ -168,7 +180,13 @@ Databases (each database gets its own dump file):
       --table-sizes N|all      Before each dump, list the N largest tables (size incl. indexes
                                and TOAST, estimated rows); 0 = off, all = every table.
                                With -t, only the matching tables are listed   (default: $DEFAULT_TABLE_SIZES)
-      --stop-on-error          Stop at the first failed database (default: continue)
+      --stop-on-error          Stop at the first failed database/table (default: continue)
+
+One file per table:
+      --per-table              Dump each table selected by -t schema.table and/or -n SCHEMA
+                               into its own file (needs at least one -t or -n)
+      --per-table-file-pattern P  File name for each table; tokens {db} {schema} {table}
+                               {date} (all required) and {ext}  (default: $DEFAULT_PER_TABLE_FILE_PATTERN)
 
 Output format:
   -F, --format FMT             plain|custom|directory|tar (p|c|d|t)  (default: custom)
@@ -392,6 +410,8 @@ load_config() {
             exclude_db|exclude_dbs) EXCLUDE_DBS=(); add_list EXCLUDE_DBS "$val" ;;
             maintenance_db)     MAINTENANCE_DB="$val" ;;
             table_sizes)        TABLE_SIZES="$val" ;;
+            per_table)          is_true "$val" && PER_TABLE=1 || PER_TABLE=0 ;;
+            per_table_file_pattern) PER_TABLE_FILE_PATTERN="$val" ;;
             stop_on_error)      is_true "$val" && STOP_ON_ERROR=1 || STOP_ON_ERROR=0 ;;
             format)             FORMAT="$val" ;;
             compress)           COMPRESS="$val" ;;
@@ -464,6 +484,8 @@ parse_args() {
             --exclude-db)       need_arg "$opt" $#; ((cli_X++)) || EXCLUDE_DBS=(); add_list EXCLUDE_DBS "$2"; shift 2 ;;
             --maintenance-db)   need_arg "$opt" $#; MAINTENANCE_DB="$2"; shift 2 ;;
             --table-sizes)      need_arg "$opt" $#; TABLE_SIZES="$2"; shift 2 ;;
+            --per-table)        PER_TABLE=1; shift ;;
+            --per-table-file-pattern) need_arg "$opt" $#; PER_TABLE_FILE_PATTERN="$2"; shift 2 ;;
             --stop-on-error)    STOP_ON_ERROR=1; shift ;;
             -W|--password)      PROMPT_PASSWORD=1; shift ;;
             --pgpassfile)       need_arg "$opt" $#; PGPASSFILE_OPT="$2"; shift 2 ;;
@@ -586,6 +608,7 @@ validate() {
     [[ -z "$RETENTION_DAYS" || "$RETENTION_DAYS" =~ ^[0-9]+$ ]] || die 1 "--retention-days must be a non-negative integer"
     [[ -n "$RETENTION_DAYS" ]] && (( RETENTION_DAYS < 1 )) && die 1 "--retention-days must be >= 1 (refusing to delete everything)"
     [[ "$MIN_FREE_MB" =~ ^[0-9]+$ ]] || die 1 "--min-free-mb must be an integer"
+    (( PER_TABLE )) && validate_per_table
     TABLE_SIZES="${TABLE_SIZES,,}"
     if [[ "$TABLE_SIZES" =~ ^[0-9]+$ ]]; then
         TABLE_SIZES=$(( 10#$TABLE_SIZES ))
@@ -729,15 +752,142 @@ table_match_sql() {   # table_match_sql PATTERN...
 readonly USER_TABLES_SQL="c.relkind = 'r' AND n.nspname NOT LIKE 'pg\\_%' AND n.nspname <> 'information_schema'"
 
 # ----------------------------------------------------------------------------
+# One file per table (--per-table)
+# ----------------------------------------------------------------------------
+validate_per_table() {
+    (( ${#INCLUDE_TABLES[@]} + ${#INCLUDE_SCHEMAS[@]} )) \
+        || die 1 "--per-table needs tables: -t schema.table (repeatable/comma list) and/or -n SCHEMA"
+    [[ -z "$FILE_NAME" ]] || die 1 "-f/--file cannot be used with --per-table (see --per-table-file-pattern)"
+    local a tok
+    for a in "${EXTRA_ARGS[@]}"; do
+        case "$a" in
+            -t|-t?*|--table|--table=*|-n|-n?*|--schema|--schema=*)
+                die 1 "With --per-table give tables/schemas as wrapper options (-t/-n), not after --" ;;
+        esac
+    done
+    for tok in "${PER_TABLE_REQUIRED_TOKENS[@]}"; do
+        [[ "$PER_TABLE_FILE_PATTERN" == *"{$tok}"* ]] \
+            || die 1 "--per-table-file-pattern must contain {$tok} (got '$PER_TABLE_FILE_PATTERN')"
+    done
+    [[ "$PER_TABLE_FILE_PATTERN" != */* && "$PER_TABLE_FILE_PATTERN" != *\\* ]] \
+        || die 1 "--per-table-file-pattern must be a file name, not a path (use --output-dir)"
+    local rest="$PER_TABLE_FILE_PATTERN"
+    rest="${rest//\{db\}/}"; rest="${rest//\{schema\}/}"; rest="${rest//\{table\}/}"
+    rest="${rest//\{date\}/}"; rest="${rest//\{ext\}/}"
+    [[ "$rest" != *[{}]* ]] || die 1 "--per-table-file-pattern: unknown token in '$PER_TABLE_FILE_PATTERN' (use {db} {schema} {table} {date} {ext})"
+    return 0
+}
+
+# Make a name safe for file names on Linux and Windows (/ \ : * ? " < > | control chars, spaces -> _).
+safe_name() {
+    local v="$1" out="" ch i
+    for (( i = 0; i < ${#v}; i++ )); do
+        ch="${v:i:1}"
+        if [[ "$ch" =~ $UNSAFE_FILE_CHARS ]]; then out+="_"; else out+="$ch"; fi
+    done
+    while [[ "$out" == *. ]]; do out="${out%.}_"; done   # Windows drops trailing dots
+    printf '%s' "${out:-_}"
+}
+
+# Literal replace without ${x//a/b}, whose '&' handling differs between bash versions.
+str_replace() {   # str_replace <text> <from> <to>
+    local s="$1" out=""
+    while [[ "$s" == *"$2"* ]]; do out+="${s%%"$2"*}$3"; s="${s#*"$2"}"; done
+    printf '%s' "$out$s"
+}
+
+glob_escape() {   # make a name match literally in find -name
+    local v="$1" out="" ch i
+    for (( i = 0; i < ${#v}; i++ )); do
+        ch="${v:i:1}"
+        case "$ch" in '['|']'|'*'|'?'|"\\") out+="\\$ch" ;; *) out+="$ch" ;; esac
+    done
+    printf '%s' "$out"
+}
+
+# Render the per-table pattern: render_table_file name|glob
+render_table_file() {
+    local mode="$1" p="$PER_TABLE_FILE_PATTERN" db sc tb dt ext
+    [[ "$p" == *"{ext}"* ]] || p+=".{ext}"
+    db="$(safe_name "$DB_NAME")"; sc="$(safe_name "$TABLE_SCHEMA")"; tb="$(safe_name "$TABLE_NAME")"
+    ext="$(extension_for_format)"
+    if [[ "$mode" == glob ]]; then
+        p="$(glob_escape "$p")"
+        db="$(glob_escape "$db")"; sc="$(glob_escape "$sc")"; tb="$(glob_escape "$tb")"
+        dt="$FILE_DATE_GLOB"; ext="$(glob_escape "$ext")"
+    else
+        dt="$(date "+$FILE_DATE_FORMAT")"
+    fi
+    p="$(str_replace "$p" "{db}" "$db")"; p="$(str_replace "$p" "{schema}" "$sc")"
+    p="$(str_replace "$p" "{table}" "$tb")"; p="$(str_replace "$p" "{date}" "$dt")"
+    p="$(str_replace "$p" "{ext}" "$ext")"
+    printf '%s' "$p"
+}
+
+quote_ident() { printf '"%s"' "${1//\"/\"\"}"; }
+
+# Resolve -t / -n into exact tables for DB_NAME. Fills PT_TABLES ("schema<FS>table")
+# and PT_MISSING (the -t/-n values that matched nothing). Returns 1 if psql fails.
+PT_TABLES=(); PT_MISSING=(); PT_ERROR=""
+resolve_tables() {
+    PT_TABLES=(); PT_MISSING=(); PT_ERROR=""
+    local -a pats=() kinds=()
+    local x i rows="" nre out excl=""
+    for x in "${INCLUDE_TABLES[@]}";  do pats+=("$x"); kinds+=("-t"); done
+    for x in "${INCLUDE_SCHEMAS[@]}"; do pats+=("$x"); kinds+=("-n"); done
+    for i in "${!pats[@]}"; do
+        pattern_to_regexes "${pats[$i]}"
+        if [[ "${kinds[$i]}" == -n ]]; then   # a schema pattern: every table in it
+            rows+="${rows:+,}($i, $(sql_literal "$PAT_REL_RE")::text, '.*'::text)"
+        else
+            if [[ -n "$PAT_NSP_RE" ]]; then nre="$(sql_literal "$PAT_NSP_RE")"; else nre="NULL"; fi
+            rows+="${rows:+,}($i, ${nre}::text, $(sql_literal "$PAT_REL_RE")::text)"
+        fi
+    done
+    (( ${#EXCLUDE_TABLES[@]} )) && excl+=" AND NOT $(table_match_sql "${EXCLUDE_TABLES[@]}")"
+    if (( ${#EXCLUDE_SCHEMAS[@]} )); then
+        local srows=""
+        for x in "${EXCLUDE_SCHEMAS[@]}"; do
+            pattern_to_regexes "$x"; srows+="${srows:+,}($(sql_literal "$PAT_REL_RE")::text)"
+        done
+        excl+=" AND NOT EXISTS (SELECT 1 FROM (VALUES $srows) AS x(re) WHERE n.nspname ~ x.re)"
+    fi
+    local sql="SET standard_conforming_strings = on;
+SELECT p.i, coalesce(n.nspname, ''), coalesce(c.relname, '')
+FROM (VALUES $rows) AS p(i, nre, rre)
+LEFT JOIN (pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace)
+  ON $USER_TABLES_SQL AND c.relname ~ p.rre
+     AND CASE WHEN p.nre IS NULL THEN pg_catalog.pg_table_is_visible(c.oid) ELSE n.nspname ~ p.nre END$excl
+ORDER BY p.i, 2, 3"
+    if ! out="$("$(bin psql)" -X -w -q -At -F "$FIELD_SEP" -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+            -c "$sql" 2>&1)"; then
+        strip_cr out; PT_ERROR="${out//$'\n'/ }"; return 1
+    fi
+    strip_cr out
+    local idx sc tb key
+    local -A seen=()
+    while IFS="$FIELD_SEP" read -r idx sc tb; do
+        [[ -n "$idx" ]] || continue
+        if [[ -z "$tb" ]]; then PT_MISSING+=("${kinds[$idx]} ${pats[$idx]}"); continue; fi
+        key="$sc$FIELD_SEP$tb"
+        [[ -n "${seen[$key]:-}" ]] && continue
+        seen[$key]=1; PT_TABLES+=("$key")
+    done <<<"$out"
+    return 0
+}
+
+# ----------------------------------------------------------------------------
 # Table-size report (before each dump). Never fails the run: problems are warnings.
 # ----------------------------------------------------------------------------
-show_table_sizes() {   # uses DB_NAME
+show_table_sizes() {   # show_table_sizes [exact-pattern...]   (uses DB_NAME; default: the -t patterns)
     [[ "$TABLE_SIZES" != 0 ]] || return 0
     if (( SKIP_PRECHECK )); then log_warn "Table sizes skipped (--skip-precheck)"; return 0; fi
     command -v "$(bin psql)" >/dev/null 2>&1 || { log_warn "Table sizes skipped: psql not found"; return 0; }
-    local -a pats=()
+    local -a pats=("$@")
     local p limit="" out sql
-    while IFS= read -r p; do [[ -n "$p" ]] && pats+=("$p"); done < <(table_patterns)
+    if (( ! $# )); then
+        while IFS= read -r p; do [[ -n "$p" ]] && pats+=("$p"); done < <(table_patterns)
+    fi
     [[ "$TABLE_SIZES" == all ]] || limit="LIMIT $TABLE_SIZES"
     sql="SET standard_conforming_strings = on;
 SELECT n.nspname || '.' || c.relname,
@@ -763,7 +913,9 @@ $limit"
         names+=("$name"); sizes+=("$size"); rows+=("$est")
         (( ${#name} > w )) && w=${#name}
     done <<<"$out"
-    if (( ${#pats[@]} )); then what="tables matching -t ${pats[*]}"; else what="tables"; fi
+    if (( PER_TABLE )); then what="selected tables"
+    elif (( ${#pats[@]} )); then what="tables matching -t ${pats[*]}"
+    else what="tables"; fi
     if (( ${#names[@]} == 0 )); then log_info "Table sizes: no $what"; return 0; fi
     if (( ${#names[@]} < total )); then
         log_info "Largest $what: top ${#names[@]} of $total (size incl. indexes and TOAST; rows are estimates)"
@@ -808,8 +960,10 @@ prepare_output_dir() {
 prepare_output_path() {  # uses DB_NAME, FILE_NAME_OVERRIDE
     if [[ -n "$FILE_NAME_OVERRIDE" ]]; then
         FILE_NAME="$FILE_NAME_OVERRIDE"
+    elif [[ -n "$TABLE_NAME" ]]; then
+        FILE_NAME="$(render_table_file name)"
     else
-        FILE_NAME="${DB_NAME}_$(date '+%Y%m%d_%H%M%S').$(extension_for_format)"
+        FILE_NAME="${DB_NAME}_$(date "+$FILE_DATE_FORMAT").$(extension_for_format)"
     fi
     OUTPUT_PATH="$OUTPUT_DIR/$FILE_NAME"
     if [[ "$DRY_RUN" -eq 0 && -e "$OUTPUT_PATH" ]]; then
@@ -831,10 +985,14 @@ build_command() {
     (( JOBS > 1 )) && CMD+=(--jobs="$JOBS")
     (( SCHEMA_ONLY )) && CMD+=(--schema-only)
     (( DATA_ONLY )) && CMD+=(--data-only)
-    for x in "${INCLUDE_SCHEMAS[@]}";    do CMD+=(--schema="$x"); done
-    for x in "${EXCLUDE_SCHEMAS[@]}";    do CMD+=(--exclude-schema="$x"); done
-    for x in "${INCLUDE_TABLES[@]}";     do CMD+=(--table="$x"); done
-    for x in "${EXCLUDE_TABLES[@]}";     do CMD+=(--exclude-table="$x"); done
+    if [[ -n "$TABLE_NAME" ]]; then   # --per-table: exactly this one table (quoted = literal)
+        CMD+=(--table="$(quote_ident "$TABLE_SCHEMA").$(quote_ident "$TABLE_NAME")")
+    else
+        for x in "${INCLUDE_SCHEMAS[@]}";    do CMD+=(--schema="$x"); done
+        for x in "${EXCLUDE_SCHEMAS[@]}";    do CMD+=(--exclude-schema="$x"); done
+        for x in "${INCLUDE_TABLES[@]}";     do CMD+=(--table="$x"); done
+        for x in "${EXCLUDE_TABLES[@]}";     do CMD+=(--exclude-table="$x"); done
+    fi
     for x in "${EXCLUDE_TABLE_DATA[@]}"; do CMD+=(--exclude-table-data="$x"); done
     (( NO_OWNER )) && CMD+=(--no-owner)
     (( NO_PRIVILEGES )) && CMD+=(--no-privileges)
@@ -971,9 +1129,14 @@ write_checksum() {
 
 apply_retention() {
     [[ -n "$RETENTION_DAYS" ]] || return 0
-    # Escape glob metacharacters in the db name so -name matches it literally.
-    local db_glob="${DB_NAME//[\[\]\*\?\\]/\\&}"
-    local pattern="${db_glob}_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9].*"
+    local pattern
+    if [[ -n "$TABLE_NAME" ]]; then
+        pattern="$(render_table_file glob)*"   # this table's files (+ .sha256)
+    else
+        # Escape glob metacharacters in the db name so -name matches it literally.
+        local db_glob="${DB_NAME//[\[\]\*\?\\]/\\&}"
+        pattern="${db_glob}_${FILE_DATE_GLOB}.*"
+    fi
     local victims=() p
     while IFS= read -r -d '' p; do
         [[ "$p" == "$OUTPUT_PATH" || "$p" == "$OUTPUT_PATH.sha256" ]] && continue
@@ -1007,7 +1170,7 @@ child_on_exit() {
         size="$(du -sh "$OUTPUT_PATH" 2>/dev/null | cut -f1)"; file="$OUTPUT_PATH"
     fi
     if (( rc == 0 )); then _log INFO "Backup completed successfully: $OUTPUT_PATH"; fi
-    printf '%s|%s|%s|%s|%s|%s\n' "$DB_NAME" "$rc" "$STAGE" "${size:--}" "$(( SECONDS - CHILD_START ))" "$file" \
+    printf '%s|%s|%s|%s|%s|%s\n' "${UNIT_LABEL//|/_}" "$rc" "$STAGE" "${size:--}" "$(( SECONDS - CHILD_START ))" "$file" \
         >"$CHILD_RESULT_FILE" 2>/dev/null || true
 }
 
@@ -1021,10 +1184,12 @@ child_on_signal() {
     exit 130
 }
 
-dump_one_db() {   # dump_one_db <dbname> <result-file>   (called inside a subshell)
+dump_one_db() {   # dump_one_db <dbname> <result-file> [schema table]   (called inside a subshell)
     IS_CHILD=1
     DB_NAME="$1"
     CHILD_RESULT_FILE="$2"
+    TABLE_SCHEMA="${3:-}"; TABLE_NAME="${4:-}"
+    UNIT_LABEL="$(unit_label "$DB_NAME" "$TABLE_SCHEMA" "$TABLE_NAME")"
     CHILD_START=$SECONDS
     OUTPUT_PATH=""; DUMP_STARTED=0; DUMP_DONE=0; PG_DUMP_PID=""
     trap child_on_exit EXIT
@@ -1033,7 +1198,7 @@ dump_one_db() {   # dump_one_db <dbname> <result-file>   (called inside a subshe
     STAGE="precheck"; prepare_output_path
     build_command
     db_prechecks
-    show_table_sizes
+    [[ -n "$TABLE_NAME" ]] || show_table_sizes   # per-table: shown once per database by the parent
     STAGE="dump";      run_dump
     STAGE="verify";    (( VERIFY )) && verify_dump
     STAGE="checksum";  (( CHECKSUM )) && write_checksum
@@ -1046,14 +1211,16 @@ dump_one_db() {   # dump_one_db <dbname> <result-file>   (called inside a subshe
 # Summary and alerts
 # ----------------------------------------------------------------------------
 summary_lines() {
-    local r db rc stage size dur file status
-    printf '%-24s %-9s %-10s %-8s %-8s %s\n' "DATABASE" "STATUS" "STAGE" "SIZE" "TIME" "FILE"
+    local r db rc stage size dur file status w=24
+    local head="DATABASE"; (( PER_TABLE )) && head="DATABASE:TABLE"
+    for r in "${RESULTS[@]}"; do db="${r%%|*}"; (( ${#db} > w )) && w=${#db}; done   # long db:table labels
+    printf "%-${w}s %-9s %-10s %-8s %-8s %s\n" "$head" "STATUS" "STAGE" "SIZE" "TIME" "FILE"
     for r in "${RESULTS[@]}"; do
         IFS='|' read -r db rc stage size dur file <<<"$r"
         if [[ "$rc" == skipped ]]; then status="SKIPPED"; stage="-"; dur="-"
         elif (( rc == 0 )); then status="OK"; stage="-"; dur="$(fmt_duration "$dur")"
         else status="FAIL($rc)"; dur="$(fmt_duration "$dur")"; fi
-        printf '%-24s %-9s %-10s %-8s %-8s %s\n' "$db" "$status" "$stage" "$size" "$dur" "$file"
+        printf "%-${w}s %-9s %-10s %-8s %-8s %s\n" "$db" "$status" "$stage" "$size" "$dur" "$file"
     done
 }
 
@@ -1208,10 +1375,68 @@ on_signal() {
         wait "$CHILD_PID" 2>/dev/null || true
         collect_result "$CURRENT_DB" "$CURRENT_RES" 130
         local k
+        local t sc tb
+        for (( k = CURRENT_TIDX + 1; k < ${#PT_TABLES[@]}; k++ )); do
+            t="${PT_TABLES[$k]}"; sc="${t%%"$FIELD_SEP"*}"; tb="${t#*"$FIELD_SEP"}"
+            RESULTS+=("$(unit_label "$CURRENT_DBNAME" "$sc" "$tb" | tr '|' _)|skipped|-|-|0|-")
+        done
         for (( k = CURRENT_IDX + 1; k < ${#DB_NAMES[@]}; k++ )); do RESULTS+=("${DB_NAMES[$k]}|skipped|-|-|0|-"); done
     fi
     STAGE="interrupted"
     exit 130
+}
+
+unit_label() {   # unit_label <db> [schema table] -> "db" or "db:schema.table"
+    if [[ -n "${3:-}" ]]; then printf '%s:%s.%s' "$1" "$2" "$3"; else printf '%s' "$1"; fi
+}
+
+RUN_WORST=0; FIRST_FAIL_STAGE=""; CURRENT_TIDX=0; CURRENT_DBNAME=""; PT_EXACT=()
+stopping() { [[ -n "$FIRST_FAIL_STAGE" ]] && (( STOP_ON_ERROR )); }
+
+note_failure() {   # note_failure <label> <rc> <stage>
+    (( $2 > RUN_WORST )) && RUN_WORST=$2
+    [[ -n "$FIRST_FAIL_STAGE" ]] || FIRST_FAIL_STAGE="$3 ($1)"
+    (( STOP_ON_ERROR )) && log_error "Stopping after failure of '$1' (--stop-on-error)"
+    return 0
+}
+
+record_failure() {   # record_failure <label> <rc> <stage>   (a failure found by the parent)
+    RESULTS+=("${1//|/_}|$2|$3|-|0|-")
+    note_failure "$1" "$2" "$3"
+}
+
+# Per-table: resolve and log this database's tables (PT_TABLES, PT_MISSING, PT_EXACT).
+per_table_list() {   # per_table_list <db>   (DB_NAME must be set)
+    local t
+    PT_EXACT=()
+    if ! command -v "$(bin psql)" >/dev/null 2>&1; then
+        log_error "--per-table needs psql to find the tables"; PT_TABLES=(); return 1
+    fi
+    if ! resolve_tables; then
+        log_error "Cannot read the table list: $PT_ERROR"; return 1
+    fi
+    for t in "${PT_MISSING[@]}"; do log_error "No table matches $t in database '$1'"; done
+    for t in "${PT_TABLES[@]}"; do
+        PT_EXACT+=("$(quote_ident "${t%%"$FIELD_SEP"*}").$(quote_ident "${t#*"$FIELD_SEP"}")")
+    done
+    local names=()
+    for t in "${PT_TABLES[@]}"; do names+=("${t%%"$FIELD_SEP"*}.${t#*"$FIELD_SEP"}"); done
+    log_info "Tables to dump (${#PT_TABLES[@]}): ${names[*]:-none}"
+    return 0
+}
+
+run_unit() {   # run_unit <db> <result-file> [schema table]  -> one child, one result row
+    local label rc=0
+    label="$(unit_label "$1" "${3:-}" "${4:-}")"
+    STAGE="dump"
+    CURRENT_DB="$label"; CURRENT_RES="$2"
+    ( dump_one_db "$@" ) &
+    CHILD_PID=$!
+    wait "$CHILD_PID" || rc=$?
+    CHILD_PID=""
+    collect_result "${label//|/_}" "$2" "$rc"
+    if (( rc != 0 )); then note_failure "$label" "$rc" "$(cut -d'|' -f3 <<<"${RESULTS[-1]}")"; fi
+    return 0
 }
 
 collect_result() {   # collect_result <db> <result-file> <rc>
@@ -1246,12 +1471,23 @@ main() {
     if (( DRY_RUN )); then
         prepare_output_dir
         # --all and the table-size report must connect
-        if (( ALL_DBS )) || [[ "$TABLE_SIZES" != 0 ]]; then prompt_password; fi
+        if (( ALL_DBS || PER_TABLE )) || [[ "$TABLE_SIZES" != 0 ]]; then prompt_password; fi
         resolve_databases
         log_info "DRY RUN - pg_dump would be executed as:"
-        local db
+        local db t
         for db in "${DB_NAMES[@]}"; do
-            DB_NAME="$db"; show_table_sizes; prepare_output_path; build_command; print_command
+            DB_NAME="$db"
+            if (( PER_TABLE )); then
+                if ! per_table_list "$db"; then continue; fi
+                (( ${#PT_EXACT[@]} )) && show_table_sizes "${PT_EXACT[@]}"
+                for t in "${PT_TABLES[@]}"; do
+                    TABLE_SCHEMA="${t%%"$FIELD_SEP"*}"; TABLE_NAME="${t#*"$FIELD_SEP"}"
+                    prepare_output_path; build_command; print_command
+                done
+                TABLE_SCHEMA=""; TABLE_NAME=""
+            else
+                show_table_sizes; prepare_output_path; build_command; print_command
+            fi
         done
         DB_NAME=""
         [[ -n "$RETENTION_DAYS" ]] && log_info "DRY RUN - would delete <db>_YYYYmmdd_HHMMSS.* in $OUTPUT_DIR older than $RETENTION_DAYS days"
@@ -1271,32 +1507,37 @@ main() {
     log_info "Databases to dump (${#DB_NAMES[@]}): ${DB_NAMES[*]}"
 
     RESULT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pg_dump_wrapper.XXXXXX")"
-    local i db rc worst=0 first_fail_stage=""
-    CURRENT_DB=""; CURRENT_RES=""; CURRENT_IDX=0
+    local i db t k
+    CURRENT_DB=""; CURRENT_RES=""; CURRENT_IDX=0; CURRENT_TIDX=0; CURRENT_DBNAME=""; PT_TABLES=()
     for i in "${!DB_NAMES[@]}"; do
         db="${DB_NAMES[$i]}"
-        if [[ -n "$first_fail_stage" ]] && (( STOP_ON_ERROR )); then
-            RESULTS+=("$db|skipped|-|-|0|-")
+        CURRENT_IDX=$i; CURRENT_DBNAME="$db"; PT_TABLES=(); CURRENT_TIDX=0
+        if stopping; then RESULTS+=("$db|skipped|-|-|0|-"); continue; fi
+        if (( ! PER_TABLE )); then
+            run_unit "$db" "$RESULT_DIR/$i.res"
             continue
         fi
-        STAGE="dump"
-        CURRENT_DB="$db"; CURRENT_RES="$RESULT_DIR/$i.res"; CURRENT_IDX=$i
-        ( dump_one_db "$db" "$CURRENT_RES" ) &
-        CHILD_PID=$!
-        rc=0
-        wait "$CHILD_PID" || rc=$?
-        CHILD_PID=""
-        collect_result "$db" "$CURRENT_RES" "$rc"
-        if (( rc != 0 )); then
-            (( rc > worst )) && worst=$rc
-            [[ -n "$first_fail_stage" ]] || first_fail_stage="$(cut -d'|' -f3 <<<"${RESULTS[-1]}") ($db)"
-            (( STOP_ON_ERROR )) && log_error "Stopping after failure of '$db' (--stop-on-error)"
+        DB_NAME="$db"
+        if ! per_table_list "$db"; then
+            DB_NAME=""; record_failure "$db" 2 precheck; continue
         fi
+        (( ${#PT_EXACT[@]} )) && show_table_sizes "${PT_EXACT[@]}"
+        DB_NAME=""
+        for t in "${PT_MISSING[@]}"; do record_failure "$db:$t" 2 precheck; done
+        for k in "${!PT_TABLES[@]}"; do
+            t="${PT_TABLES[$k]}"; CURRENT_TIDX=$k
+            if stopping; then
+                RESULTS+=("$(unit_label "$db" "${t%%"$FIELD_SEP"*}" "${t#*"$FIELD_SEP"}" | tr '|' _)|skipped|-|-|0|-")
+                continue
+            fi
+            run_unit "$db" "$RESULT_DIR/$i.$k.res" "${t%%"$FIELD_SEP"*}" "${t#*"$FIELD_SEP"}"
+        done
+        PT_TABLES=()
     done
     CURRENT_DB=""
-    if (( worst != 0 )); then
-        STAGE="$first_fail_stage"
-        exit "$worst"
+    if (( RUN_WORST != 0 )); then
+        STAGE="$FIRST_FAIL_STAGE"
+        exit "$RUN_WORST"
     fi
     STAGE="done"
     exit 0

@@ -1,4 +1,4 @@
-# pg_dump_wrapper.sh: usage examples (v2.1.0)
+# pg_dump_wrapper.sh: usage examples (v2.2.0)
 
 These are copy-paste recipes for every feature of `pg_dump_wrapper.sh`. Each example has
 **when to use it**, **the command**, and **what you get**. Where it makes sense, there's also the matching **restore** command.
@@ -33,6 +33,7 @@ Replace them with your own values.
 22. [Restore recipes](#22-restore-recipes)
 23. [Windows (Git Bash)](#23-windows-git-bash)
 24. [Table-size report (`--table-sizes`)](#24-table-size-report---table-sizes)
+25. [One file per table (`--per-table`)](#25-one-file-per-table---per-table)
 
 ---
 
@@ -965,4 +966,63 @@ In a config file: `table_sizes=25` (or `table-sizes=25`).
 ./pg_dump_wrapper.sh -d salesdb,hrdb -o /backups --dry-run --table-sizes all
 ```
 The dry run connects to read the sizes. If it can't (no password, server down), it logs a warning and still prints the commands.
+
+---
+
+## 25. One file per table (`--per-table`)
+
+**When:** you want to restore or ship single tables, keep big tables in separate files, or back up only a few tables from several databases.
+
+### 25.1 Two tables, each in its own file
+```bash
+./pg_dump_wrapper.sh -h db01.example.com -U backup_user -d salesdb -o /backups \
+  --per-table -t sales.orders,sales.customers --verify --checksum
+```
+**You get:** `salesdb_sales_orders_<date>.dump` and `salesdb_sales_customers_<date>.dump`, each with its own `.sha256`.
+
+### 25.2 Every table in a schema
+```bash
+./pg_dump_wrapper.sh -d salesdb -o /backups --per-table -n sales
+```
+
+### 25.3 The same tables from several databases
+```bash
+./pg_dump_wrapper.sh -d abc,chatagent,inventory -o /backups --per-table -n sales -t sales.orders
+```
+**Summary** (`chatagent` has no `sales.orders`, so that row fails and the run exits 2, but everything else is still dumped):
+```
+DATABASE:TABLE            STATUS    STAGE      SIZE     TIME     FILE
+abc:sales.orders          OK        -          428K     0m00s    /backups/abc_sales_orders_20261121_145303.dump
+abc:sales.customers       OK        -          4.0K     0m00s    /backups/abc_sales_customers_20261121_145303.dump
+chatagent:-t sales.orders FAIL(2)   precheck   -        0m00s    -
+inventory:sales.orders    OK        -          428K     0m00s    /backups/inventory_sales_orders_20261121_145304.dump
+inventory:sales.customers OK        -          4.0K     0m00s    /backups/inventory_sales_customers_20261121_145304.dump
+```
+
+### 25.4 Your own file names
+```bash
+./pg_dump_wrapper.sh -d salesdb -o /backups --per-table -t sales.orders -F plain \
+  --per-table-file-pattern '{schema}.{table}-{db}-{date}'
+```
+**You get:** `sales.orders-salesdb-20261121_013000.sql` (`.{ext}` is added because the pattern doesn't contain it).
+
+### 25.5 Config file
+```ini
+dbnames=salesdb,hrdb
+per_table=yes
+tables=sales.orders,hr.payroll
+per_table_file_pattern={db}_{schema}_{table}_{date}.{ext}
+retention_days=14          # per table: only that table's older files are removed
+```
+
+### 25.6 Restore one table
+```bash
+pg_restore -d salesdb_restored /backups/salesdb_sales_orders_20261121_013000.dump
+```
+
+### 25.7 Preview
+```bash
+./pg_dump_wrapper.sh -d salesdb -o /backups --per-table -t 'sales.*' --dry-run
+```
+Connects to find the tables and prints one `pg_dump ... --table="sales"."orders"` per table.
 

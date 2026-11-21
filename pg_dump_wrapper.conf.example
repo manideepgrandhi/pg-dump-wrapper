@@ -28,6 +28,8 @@ compress=6                # 0-9 or gzip:N / zstd:N / lz4 (pg_dump 16+)
 # schemas=sales,hr
 exclude_schemas=tmp
 # tables=sales.orders
+# per_table=no                                          # yes = one file per table from tables=/schemas= (needs one of them)
+# per_table_file_pattern={db}_{schema}_{table}_{date}.{ext}   # {db} {schema} {table} {date} required
 # exclude_tables=public.scratch_*
 exclude_table_data=audit.event_log,public.*_log
 no_owner=yes
