@@ -40,6 +40,7 @@ cleanup() {
     if [[ "${PDW_KEEP:-0}" == 1 ]]; then echo "kept $T"; else rm -rf -- "$T"; fi
 }
 trap cleanup EXIT
+cd "$T"   # relative paths (e.g. a Windows path an old version does not understand) land in the temp dir
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
