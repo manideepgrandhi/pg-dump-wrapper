@@ -6,7 +6,7 @@ Cron-friendly Bash wrappers around the PostgreSQL client tools. They add safe de
 
 | Tool | Version | What it does | Docs |
 |---|---|---|---|
-| [`pg_dump_wrapper.sh`](pg_dump_wrapper.sh) | 2.1.0 | Backups with `pg_dump`: every format, one/many/all databases, verification, sha256 checksums, retention, alerts | [README](#pg_dump_wrappersh) (below) · [Examples](EXAMPLES.md) · [Why this wrapper](WHY_THIS_WRAPPER.md) · [Sample config](pg_dump_wrapper.conf.example) |
+| [`pg_dump_wrapper.sh`](pg_dump_wrapper.sh) | 2.2.0 | Backups with `pg_dump`: every format, one/many/all databases, verification, sha256 checksums, retention, alerts | [README](#pg_dump_wrappersh) (below) · [Examples](EXAMPLES.md) · [Why this wrapper](WHY_THIS_WRAPPER.md) · [Sample config](pg_dump_wrapper.conf.example) |
 | [`psql_wrapper.sh`](psql_wrapper.sh) | 1.0.0 | One tool, three commands: `migrate` (transactional, tracked SQL migrations with a production guard), `query` (CSV/TSV/JSON/NDJSON exports and scheduled reports), `health` (sizes, connections, locks, long queries, bloat, replication, cache, vacuum, wraparound with WARN/CRIT thresholds) | [README](README_psql.md) · [Examples](EXAMPLES_psql.md) · [Why this wrapper](WHY_PSQL_WRAPPER.md) · [Sample config](psql_wrapper.conf.example) |
 
 A matching `pg_restore` wrapper is planned and not in this repository yet. Until then, restore with the `pg_restore` / `psql` commands shown in [EXAMPLES.md](EXAMPLES.md).
@@ -34,7 +34,7 @@ alerts, so one command (or one cron line) produces reliable, consistently named 
 pg_dump_wrapper.sh (-d DB[,DB...] | --all) [options] [-- extra pg_dump args]
 ```
 
-Version 2.1.0. Needs Bash 4.4 or newer. Runs on Linux and on Windows in Git Bash (see [Windows (Git Bash)](#windows-git-bash)). Changes: [CHANGELOG.md](CHANGELOG.md).
+Version 2.2.0. Needs Bash 4.4 or newer. Runs on Linux and on Windows in Git Bash (see [Windows (Git Bash)](#windows-git-bash)). Changes: [CHANGELOG.md](CHANGELOG.md).
 
 📘 **For copy-paste recipes for every scenario (formats, filters, migration, multiple databases, alerts, cron/systemd, exit codes, errors, restores), see [EXAMPLES.md](EXAMPLES.md).**
 
@@ -90,6 +90,28 @@ Shown on screen and in the log before each dump, and in `--dry-run` (which then 
 - Only ordinary tables are listed. Each partition shows as its own table.
 - `-t` patterns follow pg_dump's common rules: `*` and `?` are wildcards, unquoted names are lower-cased, `"Quoted"` parts keep their case, and `schema.table` limits the schema. An unqualified name only matches tables visible on the `search_path`, as in pg_dump. Other regex characters (`[ ] + ( )`…) are matched literally here.
 - Skipped with a warning when `--skip-precheck` is used, `psql` is missing, or the query fails (for example, no permission).
+
+### One file per table (`--per-table`)
+| Option | Purpose |
+|---|---|
+| `--per-table` | Runs **one pg_dump per table** and writes each table to its own file. Pick the tables with `-t schema.table` (repeatable or comma list; `*`/`?` wildcards work) and/or `-n SCHEMA` (every table in that schema). It needs at least one `-t` or `-n`, can't be combined with `-f`, and `-t`/`-n` must be wrapper options, not after `--`. Config: `per_table=yes`. |
+| `--per-table-file-pattern P` | The file name for each table. Tokens: `{db}`, `{schema}`, `{table}`, `{date}` (all four required) and `{ext}` (the format's extension, added at the end if you leave it out). Default: `{db}_{schema}_{table}_{date}.{ext}`, for example `salesdb_sales_orders_20261121_013000.dump`. Config: `per_table_file_pattern=` (or `per-table-file-pattern=`). |
+
+How it works:
+- For each database, the wrapper looks up the matching tables (ordinary tables, system schemas excluded, `-T`/`-N` exclusions applied), logs them, and shows their sizes once (see the table-size report above).
+- Each table is dumped with `--table="schema"."table"` (exact match), in its own child process with its own pre-check, `--verify`, `--checksum` and retention. Retention only deletes older files of **that** table (same name pattern with a different date).
+- Names are made safe for file systems on Linux and Windows: `/ \ : * ? " < > |`, spaces and control characters become `_`, and trailing dots are dropped. Two tables whose safe names collide in the same second fail with "Output already exists" and nothing is overwritten.
+- A `-t`/`-n` that matches nothing in a database is a `FAIL(2) precheck` row (for example `chatagent:-t sales.orders`). One failing table never stops the others unless you use `--stop-on-error`, which marks the rest `SKIPPED`. The exit code is the highest of any row.
+- Works with `-d a,b,c` and `--all`. The summary has one row per table:
+
+```
+DATABASE:TABLE            STATUS    STAGE      SIZE     TIME     FILE
+abc:sales.orders          OK        -          428K     0m00s    /backups/abc_sales_orders_20261121_145303.dump
+abc:sales.customers       OK        -          4.0K     0m00s    /backups/abc_sales_customers_20261121_145303.dump
+chatagent:-t sales.orders FAIL(2)   precheck   -        0m00s    -
+inventory:sales.orders    OK        -          428K     0m00s    /backups/inventory_sales_orders_20261121_145304.dump
+inventory:sales.customers OK        -          4.0K     0m00s    /backups/inventory_sales_customers_20261121_145304.dump
+```
 
 ### Format and performance
 | Option | pg_dump flag | Purpose |

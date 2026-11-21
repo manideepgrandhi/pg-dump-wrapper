@@ -83,6 +83,11 @@ done
     CREATE TABLE sales.\"MixedCase\"(id int);
     INSERT INTO sales.\"MixedCase\" VALUES (1),(2),(3);
     ANALYZE;" >/dev/null
+# inventory also has sales.orders; invent has a table whose name is not file-system safe
+"$CLIENT_BIN/psql" -X -q -h 127.0.0.1 -p "$PORT" -U "$PGUSER_T" -d inventory -c "
+    CREATE SCHEMA sales; CREATE TABLE sales.orders(id int); INSERT INTO sales.orders SELECT generate_series(1,10); ANALYZE;" >/dev/null
+"$CLIENT_BIN/psql" -X -q -h 127.0.0.1 -p "$PORT" -U "$PGUSER_T" -d invent -c "
+    CREATE SCHEMA \"odd sch\"; CREATE TABLE \"odd sch\".\"we|ird:na*me\"(id int); INSERT INTO \"odd sch\".\"we|ird:na*me\" VALUES (1);" >/dev/null
 unset PGPASSFILE
 COMMON=(-h 127.0.0.1 -p "$PORT" -U "$PGUSER_T" --pgpassfile "$PGPASS_FILE" --min-free-mb 1)
 
@@ -346,6 +351,72 @@ check "Windows CRLF tools: report has clean rows" bash -c 'grep -qE "sales\.orde
 check "Windows CRLF tools: no CR in the log" bash -c "! grep -q \$'\\r' '$DRIVES/c/sizes/pg_dump_wrapper.log'"
 
 # ----------------------------------------------------------------------------
+section "One file per table (--per-table)"
+Q="$T/pertable"; mkdir -p "$Q"
+
+run -- "${COMMON[@]}" -d abc --per-table -o "$Q/none"
+check "--per-table without -t/-n -> exit 1" bash -c '[[ $1 -eq 1 ]] && grep -q "needs tables" <<<"$2"' _ "$RC" "$OUT"
+run -- "${COMMON[@]}" -d abc --per-table -t sales.orders -f x.dump -o "$Q/f"
+check "--per-table with -f -> exit 1" test "$RC" -eq 1
+run -- "${COMMON[@]}" -d abc --per-table -n sales -o "$Q/extra" -- -t public.t_abc
+check "--per-table with -t after -- -> exit 1" test "$RC" -eq 1
+run -- "${COMMON[@]}" -d abc --per-table -t sales.orders --per-table-file-pattern '{db}_{schema}_{table}.dump' -o "$Q/p1"
+check "file pattern without {date} -> exit 1" bash -c '[[ $1 -eq 1 ]] && grep -q "must contain {date}" <<<"$2"' _ "$RC" "$OUT"
+run -- "${COMMON[@]}" -d abc --per-table -t sales.orders --per-table-file-pattern '{db}_{schema}_{table}_{date}_{host}' -o "$Q/p2"
+check "file pattern with unknown token -> exit 1" bash -c '[[ $1 -eq 1 ]] && grep -q "unknown token" <<<"$2"' _ "$RC" "$OUT"
+
+run -- "${COMMON[@]}" -d abc --per-table -t sales.orders,public.t_abc --verify --checksum -o "$Q/two"
+check "-t sales.orders,public.t_abc -> exit 0" test "$RC" -eq 0
+check "one file per table" bash -c '[[ $(ls "$1"/abc_sales_orders_*.dump | wc -l) -eq 1 && $(ls "$1"/abc_public_t_abc_*.dump | wc -l) -eq 1 ]]' _ "$Q/two"
+check "per-file checksums validate" bash -c "cd '$Q/two' && for f in *.sha256; do sha256sum -c --quiet \"\$f\" || exit 1; done && [[ \$(ls *.sha256 | wc -l) -eq 2 ]]"
+check "per-file verify ran twice" bash -c '[[ $(grep -c "Verification OK" <<<"$1") -eq 2 ]]' _ "$OUT"
+check "summary has one row per table" bash -c 'grep -q "DATABASE:TABLE" <<<"$1" && grep -qE "abc:sales\.orders +OK" <<<"$1" && grep -qE "abc:public\.t_abc +OK" <<<"$1"' _ "$OUT"
+check "each file holds only its table" bash -c 'l="$("$1"/pg_restore --list "$2"/abc_sales_orders_*.dump)"; grep -q "TABLE DATA sales orders" <<<"$l" && ! grep -q "t_abc" <<<"$l"' _ "$CLIENT_BIN" "$Q/two"
+check "table sizes listed once for the selected tables" bash -c '[[ $(grep -c "Largest selected tables: all 2" <<<"$1") -eq 1 ]]' _ "$OUT"
+
+run -- "${COMMON[@]}" -d abc --per-table -n sales -o "$Q/schema"
+check "-n sales -> every table in the schema (2)" bash -c '[[ $1 -eq 0 ]] && [[ $(ls "$2"/*.dump | wc -l) -eq 2 ]] && ls "$2"/abc_sales_MixedCase_*.dump >/dev/null' _ "$RC" "$Q/schema"
+
+run -- "${COMMON[@]}" -d invent --per-table -n 'odd sch' -o "$Q/odd"
+check "unsafe names sanitised: invent_odd_sch_we_ird_na_me_<date>.dump" bash -c '[[ $1 -eq 0 ]] && ls "$2"/invent_odd_sch_we_ird_na_me_*.dump >/dev/null' _ "$RC" "$Q/odd"
+
+run -- "${COMMON[@]}" -d abc,chatagent,inventory --per-table -t sales.orders -o "$Q/multi"
+check "multi-db: exit 2 because chatagent has no sales.orders" test "$RC" -eq 2
+check "multi-db: clear message for the missing table" has "No table matches -t sales.orders in database 'chatagent'"
+check "multi-db: FAIL row for chatagent, OK rows for abc and inventory" bash -c 'grep -qE "chatagent:-t sales\.orders +FAIL\(2\) +precheck" <<<"$1" && grep -qE "abc:sales\.orders +OK" <<<"$1" && grep -qE "inventory:sales\.orders +OK" <<<"$1"' _ "$OUT"
+check "multi-db: 2 files written" test "$(count_files "$Q/multi" '*.dump')" -eq 2
+
+run -- "${COMMON[@]}" -d chatagent,abc --per-table -t sales.orders --stop-on-error -o "$Q/stop"
+check "--stop-on-error: later database SKIPPED" bash -c '[[ $1 -eq 2 ]] && grep -qE "INFO\]   abc +SKIPPED" <<<"$2"' _ "$RC" "$OUT"
+
+run -- "${COMMON[@]}" -d abc --per-table -t sales.orders,nosuch.table,public.t_abc -o "$Q/partial"
+check "one missing table does not stop the others" bash -c '[[ $1 -eq 2 ]] && [[ $(ls "$2"/*.dump | wc -l) -eq 2 ]] && grep -q "abc:-t nosuch.table" <<<"$3"' _ "$RC" "$Q/partial" "$OUT"
+
+printf 'host=127.0.0.1\nport=%s\nuser=%s\ndbnames=abc\npgpassfile=%s\nmin_free_mb=1\nper-table=yes\ntables=sales.orders\nformat=plain\nper-table-file-pattern={schema}.{table}-{db}-{date}\n' \
+    "$PORT" "$PGUSER_T" "$PGPASS_FILE" >"$Q/pt.conf"
+run -- --config "$Q/pt.conf" -o "$Q/conf" --verify
+check "config per-table-file-pattern (no {ext} -> .sql appended)" bash -c '[[ $1 -eq 0 ]] && ls "$2"/sales.orders-abc-2*.sql >/dev/null' _ "$RC" "$Q/conf"
+
+mkdir -p "$Q/ret"
+for f in abc_sales_orders_20200101_000000.dump abc_sales_orders_20200101_000000.dump.sha256 \
+         abc_sales_orders_extra_20200101_000000.dump abc_20200101_000000.dump abc_public_t_abc_20200101_000000.dump; do
+    : >"$Q/ret/$f"; touch -d "$OLD_DAYS days ago" "$Q/ret/$f"
+done
+run -- "${COMMON[@]}" -d abc --per-table -t sales.orders -r "$RETENTION" -o "$Q/ret"
+check "retention deletes this table's old files" test ! -e "$Q/ret/abc_sales_orders_20200101_000000.dump" -a ! -e "$Q/ret/abc_sales_orders_20200101_000000.dump.sha256"
+check "retention keeps other tables' and whole-db files" test -e "$Q/ret/abc_sales_orders_extra_20200101_000000.dump" -a -e "$Q/ret/abc_20200101_000000.dump" -a -e "$Q/ret/abc_public_t_abc_20200101_000000.dump"
+
+run -- "${COMMON[@]}" -d abc --per-table -t 'sales.*' -F directory -j 2 --dry-run -o "$Q/dry"
+check "dry-run: one command per table, exact quoted --table" bash -c '[[ ! -e $2 ]] && grep -qF -- "--table=\\\"sales\\\".\\\"orders\\\"" <<<"$1" && [[ $(grep -c -- "--file=" <<<"$1") -eq 2 ]]' _ "$OUT" "$Q/dry"
+
+run -- "${COMMON[@]}" -d abc --per-table -t sales.orders -F directory -j 2 --checksum -o "$Q/dir"
+check "directory format per table" bash -c '[[ $1 -eq 0 ]] && cd "$2" && sha256sum -c --quiet abc_sales_orders_*.dir.sha256' _ "$RC" "$Q/dir"
+
+run "${WENV[@]}" -- "${WCOMMON[@]}" -d abc,inventory --per-table -t sales.orders --verify --checksum -o 'C:\pertable'
+check "Windows CRLF tools: per-table for 2 databases" bash -c '[[ $1 -eq 0 ]] && [[ $(ls "$2"/*_sales_orders_*.dump | wc -l) -eq 2 ]]' _ "$RC" "$DRIVES/c/pertable"
+check "Windows: no CR in table names / log" bash -c "! grep -q \$'\\r' '$DRIVES/c/pertable/pg_dump_wrapper.log'"
+
+# ----------------------------------------------------------------------------
 section "-W: one prompt from the terminal (driven through a pty with script(1))"
 P="$T/prompt"; mkdir -p "$P"
 NOPASS=(-h 127.0.0.1 -p "$PORT" -U "$PGUSER_T" --min-free-mb 1)
@@ -406,7 +477,7 @@ section "Static checks"
 if command -v shellcheck >/dev/null 2>&1; then
     OUT="$(shellcheck -e SC2329 "$WRAPPER" 2>&1)"; check "shellcheck clean" test -z "$OUT"
 fi
-OUT="$(bash "$WRAPPER" --version)"; check "--version" has "2.1.0"
+OUT="$(bash "$WRAPPER" --version)"; check "--version" has "2.2.0"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
