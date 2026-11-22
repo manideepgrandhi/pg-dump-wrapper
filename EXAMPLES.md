@@ -1,4 +1,4 @@
-# pg_dump_wrapper.sh: usage examples (v2.2.0)
+# pg_dump_wrapper.sh: usage examples (v2.3.0)
 
 These are copy-paste recipes for every feature of `pg_dump_wrapper.sh`. Each example has
 **when to use it**, **the command**, and **what you get**. Where it makes sense, there's also the matching **restore** command.
@@ -34,6 +34,7 @@ Replace them with your own values.
 23. [Windows (Git Bash)](#23-windows-git-bash)
 24. [Table-size report (`--table-sizes`)](#24-table-size-report---table-sizes)
 25. [One file per table (`--per-table`)](#25-one-file-per-table---per-table)
+26. [Many servers in one run (`--servers`)](#26-many-servers-in-one-run---servers)
 
 ---
 
@@ -1026,3 +1027,94 @@ pg_restore -d salesdb_restored /backups/salesdb_sales_orders_20261121_013000.dum
 ```
 Connects to find the tables and prints one `pg_dump ... --table="sales"."orders"` per table.
 
+## 26. Many servers in one run (`--servers`)
+
+**When:** you back up several servers that run on different ports, with different users or passwords, and you
+want one command (or one cron line), one summary and one alert.
+
+### 26.1 The servers file
+`/etc/pg_backup/servers.txt` (one server per line: `host,port,user,databases`):
+```
+# host,port,user,databases
+db01.example.com,5432,backup_user,all
+db02.example.com,5433,backup_user,salesdb,hrdb
+db03.example.com,6432,,all              # empty user -> -U / user= / $PGUSER
+```
+`all` means every database (like `--all`); otherwise list the databases after the third comma.
+
+### 26.2 Passwords: one `.pgpass` line per server
+`~/.pgpass` (Linux, `chmod 600 ~/.pgpass`) or `%APPDATA%\postgresql\pgpass.conf` (Windows):
+```
+db01.example.com:5432:*:backup_user:Example-Pass-1
+db02.example.com:5433:*:backup_user:Example-Pass-2
+db03.example.com:6432:*:dbadmin:Example-Pass-3
+```
+Each line is `host:port:database:user:password`, and `*` means any database. Postgres picks the line that matches
+the host, port and user it connects to. `-W` can't be used with `--servers`.
+
+### 26.3 Back up all of them (Linux)
+```bash
+./pg_dump_wrapper.sh --servers /etc/pg_backup/servers.txt -U dbadmin \
+  -o /backups --verify --checksum -r 14
+```
+**You get** one folder per server:
+```
+/backups/db01.example.com_5432/salesdb_20261121_013000.dump
+/backups/db02.example.com_5433/salesdb_20261121_013002.dump
+/backups/db03.example.com_6432/...
+/backups/pg_dump_wrapper.log          # one log, lines tagged [host:port/db]
+```
+**Summary** (`db02` was down: it fails, the others still run, the exit code is 2):
+```
+SERVER/DATABASE                 STATUS    STAGE      SIZE     TIME     FILE
+db01.example.com:5432/salesdb   OK        -          144K     0m00s    /backups/db01.example.com_5432/salesdb_20261121_013000.dump
+db01.example.com:5432/hrdb      OK        -          24K      0m01s    /backups/db01.example.com_5432/hrdb_20261121_013000.dump
+db02.example.com:5433           FAIL(2)   precheck   -        0m00s    -
+db03.example.com:6432/salesdb   OK        -          4.0K     0m00s    /backups/db03.example.com_6432/salesdb_20261121_013001.dump
+```
+Add `--stop-on-error` to stop at the first failed server; the rest are shown as `SKIPPED`.
+
+### 26.4 Windows (Git Bash)
+```bash
+./pg_dump_wrapper.sh --servers 'C:\pg\servers.txt' -U dbadmin \
+  --pgpassfile 'C:\Users\me\AppData\Roaming\postgresql\pgpass.conf' \
+  --pg-bin 'C:/Program Files/pgAdmin 4/runtime' -o 'C:\backups'
+```
+The servers file can be edited in Notepad (CRLF line endings are fine). Dumps go to `C:\backups\<host>_<port>\`.
+
+### 26.5 Config file and cron
+```ini
+servers_file=/etc/pg_backup/servers.txt
+user=dbadmin
+pgpassfile=/etc/pg_backup/.pgpass
+output_dir=/backups
+retention_days=14
+verify=yes
+checksum=yes
+alert_email=dba@example.com
+```
+```
+30 1 * * * /opt/pg_backup/pg_dump_wrapper.sh --config /etc/pg_backup/pg_dump_wrapper.conf
+```
+`host=`/`port=` in the config are ignored when `servers_file=` is set.
+
+### 26.6 Preview
+```bash
+./pg_dump_wrapper.sh --servers /etc/pg_backup/servers.txt -U dbadmin -o /backups --dry-run
+```
+```
+[INFO] DRY RUN - 3 server(s) from /etc/pg_backup/servers.txt, one after another:
+[INFO] [db01.example.com:5432] Server 1/3: db01.example.com:5432 user=dbadmin -> /backups/db01.example.com_5432
+[INFO] [db01.example.com:5432] Databases selected by --all: hrdb salesdb
+pg_dump --host=db01.example.com --port=5432 --username=dbadmin --dbname=hrdb ... --file=/backups/db01.example.com_5432/hrdb_20261121_013000.dump --no-password
+...
+```
+
+### 26.7 Mistakes it catches (before anything is dumped)
+```
+Servers file servers.txt:2: host is missing (expected host,port,user,databases)
+Servers file servers.txt:3: invalid port '54x' for host db02.example.com (expected a number 1-65535; ...)
+Servers file servers.txt:4: db01.example.com:5432 is already listed on line 1
+-h cannot be used with --servers: host and port come from each line of the servers file
+-W cannot be used with --servers (each server has its own password). Put one line per server in ~/.pgpass ...
+```

@@ -16,6 +16,8 @@
 #   PDW_SERVER_BIN   dir with initdb/pg_ctl       (default: dir of `initdb` in PATH)
 #   PDW_CLIENT_BIN   dir with pg_dump/psql/...    (default: dir of `pg_dump` in PATH)
 #   PDW_TEST_PORT    port for the test cluster    (default: 54329)
+#   PDW_TEST_PORT2   port for the second cluster  (default: PDW_TEST_PORT + 1)
+#   PDW_TEST_DOWN_PORT  a port nothing listens on (default: PDW_TEST_PORT + 2)
 #   PDW_KEEP         1 = keep the temp dir for inspection
 set -uo pipefail
 
@@ -36,8 +38,10 @@ RETENTION=7
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/pdw-test.XXXXXX")"
 PGDATA_T="$T/pgdata"
+PGDATA2_T="$T/pgdata2"   # second cluster for the --servers tests
 cleanup() {
     "$SERVER_BIN/pg_ctl" -D "$PGDATA_T" -m fast -w stop >/dev/null 2>&1 || true
+    [[ -d "$PGDATA2_T" ]] && { "$SERVER_BIN/pg_ctl" -D "$PGDATA2_T" -m fast -w stop >/dev/null 2>&1 || true; }
     if [[ "${PDW_KEEP:-0}" == 1 ]]; then echo "kept $T"; else rm -rf -- "$T"; fi
 }
 trap cleanup EXIT
@@ -473,11 +477,116 @@ RUNTTY_ENV=()
 check "-W --all with simulated Windows tools" test "$RC" -eq 0 -a "$(count_files "$DRIVES/c/wprompt" '*.dump')" -eq 5
 
 # ----------------------------------------------------------------------------
+section "Many servers (--servers FILE): two clusters, different ports and passwords"
+PORT2="${PDW_TEST_PORT2:-$((PORT + 1))}"
+DOWN_PORT="${PDW_TEST_DOWN_PORT:-$((PORT + 2))}"   # nothing listens here
+PASSWORD2="pdw_test_pw_two"
+printf '%s\n' "$PASSWORD2" >"$T/pw2"
+"$SERVER_BIN/initdb" -D "$PGDATA2_T" -U "$PGUSER_T" --auth=scram-sha-256 --pwfile="$T/pw2" >"$T/initdb2.log" 2>&1 \
+    || { cat "$T/initdb2.log"; exit 2; }
+"$SERVER_BIN/pg_ctl" -D "$PGDATA2_T" -l "$T/server2.log" -w \
+    -o "-p $PORT2 -k $T -c listen_addresses=127.0.0.1" start >/dev/null || { cat "$T/server2.log"; exit 2; }
+M="$T/servers"; mkdir -p "$M"
+SPASS="$M/pgpass"   # one line per server, each with its own password
+printf '127.0.0.1:%s:*:%s:%s\n127.0.0.1:%s:*:%s:%s\n' "$PORT" "$PGUSER_T" "$PASSWORD_T" "$PORT2" "$PGUSER_T" "$PASSWORD2" >"$SPASS"
+chmod 600 "$SPASS"
+for db in abc hr; do   # abc exists on both servers (different content)
+    PGPASSFILE="$SPASS" "$CLIENT_BIN/psql" -X -q -h 127.0.0.1 -p "$PORT2" -U "$PGUSER_T" -d postgres -c "CREATE DATABASE $db" >/dev/null
+    PGPASSFILE="$SPASS" "$CLIENT_BIN/psql" -X -q -h 127.0.0.1 -p "$PORT2" -U "$PGUSER_T" -d "$db" \
+        -c "CREATE TABLE t_two_$db(id int primary key); INSERT INTO t_two_$db SELECT generate_series(1,100)" >/dev/null
+done
+S1="127.0.0.1_$PORT"; S2="127.0.0.1_$PORT2"
+SCOMMON=(-U "$PGUSER_T" --pgpassfile "$SPASS" --min-free-mb 1)
+printf '# host,port,user,databases\n127.0.0.1,%s,%s,abc,chatagent\n\n  127.0.0.1 , %s , , all  \n' "$PORT" "$PGUSER_T" "$PORT2" >"$M/servers.txt"
+
+run -- "${SCOMMON[@]}" --servers "$M/servers.txt" -o "$M/out" --verify --checksum
+check "--servers with 2 servers exits 0" test "$RC" -eq 0
+check "server 1 (abc,chatagent) dumped into its host_port folder" bash -c '[[ $(ls "$1"/abc_*.dump "$1"/chatagent_*.dump | wc -l) -eq 2 ]]' _ "$M/out/$S1"
+check "server 2 (all = abc hr postgres) dumped into its own folder" bash -c '[[ $(ls "$1"/*.dump | wc -l) -eq 3 ]] && ls "$1"/hr_*.dump >/dev/null' _ "$M/out/$S2"
+check "same database name on both servers does not collide" bash -c 'l1="$("$1"/pg_restore --list "$2"/abc_*.dump)"; l2="$("$1"/pg_restore --list "$3"/abc_*.dump)"; grep -q t_abc <<<"$l1" && grep -q t_two_abc <<<"$l2" && ! grep -q t_two_abc <<<"$l1"' _ "$CLIENT_BIN" "$M/out/$S1" "$M/out/$S2"
+check "combined summary labels rows host:port/db" bash -c 'grep -q "SERVER/DATABASE" <<<"$1" && grep -qE "127\.0\.0\.1:$2/abc +OK" <<<"$1" && grep -qE "127\.0\.0\.1:$3/abc +OK" <<<"$1" && grep -qE "127\.0\.0\.1:$3/hr +OK" <<<"$1"' _ "$OUT" "$PORT" "$PORT2"
+check "full output paths printed" has "Backup completed successfully: $M/out/$S2/hr_"
+check "one log file, lines tagged with the server" grep -q "\[127.0.0.1:$PORT2/hr\]" "$M/out/pg_dump_wrapper.log"
+check "verify and checksum ran per server" bash -c '[[ $(grep -c "Verification OK" <<<"$1") -eq 5 ]] && cd "$2" && sha256sum -c --quiet hr_*.sha256' _ "$OUT" "$M/out/$S2"
+
+printf '127.0.0.1,%s,,abc\n127.0.0.1,%s,,abc\n127.0.0.1,%s,,hr\n' "$PORT" "$DOWN_PORT" "$PORT2" >"$M/down.txt"
+run -- "${SCOMMON[@]}" --servers "$M/down.txt" -o "$M/down"
+check "one server down -> exit 2" test "$RC" -eq 2
+check "down server gets a FAIL(2) precheck row" bash -c 'grep -qE "127\.0\.0\.1:$2 +FAIL\(2\) +precheck" <<<"$1"' _ "$OUT" "$DOWN_PORT"
+check "the other servers still dumped" bash -c '[[ $(ls "$1"/$2/abc_*.dump "$1"/$3/hr_*.dump | wc -l) -eq 2 ]]' _ "$M/down" "$S1" "$S2"
+
+printf '127.0.0.1,%s,,abc\n127.0.0.1,%s,,abc\n127.0.0.1,%s,,hr\n' "$DOWN_PORT" "$PORT" "$PORT2" >"$M/downfirst.txt"
+run -- "${SCOMMON[@]}" --servers "$M/downfirst.txt" --stop-on-error -o "$M/stop"
+check "--stop-on-error: exit 2, later servers SKIPPED, nothing dumped" bash -c '[[ $1 -eq 2 ]] && [[ $(grep -cE "127\.0\.0\.1:[0-9]+ +SKIPPED" <<<"$2") -eq 2 ]] && ! ls "$3"/*/*.dump >/dev/null 2>&1' _ "$RC" "$OUT" "$M/stop"
+
+run -- "${SCOMMON[@]}" --servers "$M/servers.txt" -W -o "$M/w"
+check "-W with --servers -> exit 1, points to .pgpass" bash -c '[[ $1 -eq 1 ]] && grep -q "\-W cannot be used with --servers" <<<"$2" && grep -q "pgpass" <<<"$2"' _ "$RC" "$OUT"
+run -- "${SCOMMON[@]}" --servers "$M/servers.txt" -h 127.0.0.1 -o "$M/h"
+check "-h with --servers -> exit 1" bash -c '[[ $1 -eq 1 ]] && grep -q "\-h cannot be used with --servers" <<<"$2"' _ "$RC" "$OUT"
+run -- "${SCOMMON[@]}" --servers "$M/servers.txt" --port "$PORT" -o "$M/p"
+check "--port with --servers -> exit 1" test "$RC" -eq 1
+
+printf '127.0.0.1,%s,,abc\n,5432,,abc\n' "$PORT" >"$M/bad1.txt"
+run -- "${SCOMMON[@]}" --servers "$M/bad1.txt" -o "$M/bad"
+check "missing host -> exit 1 with line number" bash -c '[[ $1 -eq 1 ]] && grep -q "bad1.txt:2: host is missing" <<<"$2"' _ "$RC" "$OUT"
+printf '# c\n127.0.0.1,%s,,abc\n127.0.0.1,54x,,abc\n' "$PORT" >"$M/bad2.txt"
+run -- "${SCOMMON[@]}" --servers "$M/bad2.txt" -o "$M/bad"
+check "non-numeric port -> exit 1 with line number" bash -c '[[ $1 -eq 1 ]] && grep -q "bad2.txt:3: invalid port .54x." <<<"$2"' _ "$RC" "$OUT"
+printf '127.0.0.1,%s\n' "$PORT" >"$M/bad3.txt"
+run -- "${SCOMMON[@]}" --servers "$M/bad3.txt" -o "$M/bad"
+check "no databases and no -d/--all -> exit 1 with line number" bash -c '[[ $1 -eq 1 ]] && grep -q "bad3.txt:1: no databases" <<<"$2"' _ "$RC" "$OUT"
+printf '127.0.0.1,%s,,abc\n127.0.0.1,%s,,hr\n' "$PORT" "$PORT" >"$M/bad4.txt"
+run -- "${SCOMMON[@]}" --servers "$M/bad4.txt" -o "$M/bad"
+check "same host:port twice -> exit 1" bash -c '[[ $1 -eq 1 ]] && grep -q "bad4.txt:2: 127.0.0.1:$2 is already listed on line 1" <<<"$3"' _ "$RC" "$PORT" "$OUT"
+check "no output written for invalid files" test ! -e "$M/bad"
+
+printf '127.0.0.1,%s\n127.0.0.1,%s,,\n' "$PORT" "$PORT2" >"$M/default.txt"
+run -- "${SCOMMON[@]}" --servers "$M/default.txt" -d abc -o "$M/default"
+check "empty databases field uses -d" bash -c '[[ $1 -eq 0 ]] && [[ $(ls "$2"/*/*.dump | wc -l) -eq 2 ]]' _ "$RC" "$M/default"
+
+run -- "${SCOMMON[@]}" --servers "$M/servers.txt" --dry-run --table-sizes 0 -o "$M/dry"
+check "dry-run lists each server and its commands, writes nothing" bash -c '[[ $1 -eq 0 && ! -e $2 ]] && grep -q "Server 1/2: 127.0.0.1:$3 user=postgres" <<<"$4" && grep -q -- "--file=$2/127.0.0.1_$3/abc_" <<<"$4" && grep -q -- "--file=$2/127.0.0.1_$5/hr_" <<<"$4" && [[ $(grep -c -- "--file=" <<<"$4") -eq 5 ]]' _ "$RC" "$M/dry" "$PORT" "$OUT" "$PORT2"
+printf '127.0.0.1,%s,,all\n127.0.0.1,%s,,hr\n' "$DOWN_PORT" "$PORT2" >"$M/drydown.txt"
+run -- "${SCOMMON[@]}" --servers "$M/drydown.txt" --dry-run --table-sizes 0 -o "$M/drydown"
+check "dry-run: 'all' on a down server -> error, exit 2, next server still listed" bash -c '[[ $1 -eq 2 ]] && grep -q "Cannot list databases" <<<"$2" && grep -q -- "--file=$3/127.0.0.1_$4/hr_" <<<"$2"' _ "$RC" "$OUT" "$M/drydown" "$PORT2"
+
+printf '127.0.0.1,%s,,abc\n127.0.0.1,%s,,abc\n' "$PORT" "$PORT2" >"$M/pt.txt"
+run -- "${SCOMMON[@]}" --servers "$M/pt.txt" --per-table -n public -o "$M/pt"
+check "--per-table per server: host:port/db:schema.table rows" bash -c '[[ $1 -eq 0 ]] && grep -qE "127\.0\.0\.1:$3/abc:public\.t_abc +OK" <<<"$2" && grep -qE "127\.0\.0\.1:$4/abc:public\.t_two_abc +OK" <<<"$2"' _ "$RC" "$OUT" "$PORT" "$PORT2"
+check "--per-table files in each server folder" bash -c 'ls "$1"/$2/abc_public_t_abc_*.dump "$1"/$3/abc_public_t_two_abc_*.dump >/dev/null' _ "$M/pt" "$S1" "$S2"
+
+mkdir -p "$M/ret/$S1" "$M/ret/$S2"
+for f in "$S1/abc_20200101_000000.dump" "$S2/abc_20200101_000000.dump" "$S2/hr_20200101_000000.dump"; do
+    : >"$M/ret/$f"; touch -d "$OLD_DAYS days ago" "$M/ret/$f"
+done
+printf '127.0.0.1,%s,,abc\n127.0.0.1,%s,,abc\n' "$PORT" "$PORT2" >"$M/ret.txt"
+run -- "${SCOMMON[@]}" --servers "$M/ret.txt" -r "$RETENTION" -o "$M/ret"
+check "retention runs in each server folder" test ! -e "$M/ret/$S1/abc_20200101_000000.dump" -a ! -e "$M/ret/$S2/abc_20200101_000000.dump"
+check "retention keeps other databases' files" test -e "$M/ret/$S2/hr_20200101_000000.dump"
+
+printf 'servers-file=%s\nuser=%s\npgpassfile=%s\noutput_dir=%s\nmin_free_mb=1\ntable_sizes=0\nhost=db.example.com\n' \
+    "$M/servers.txt" "$PGUSER_T" "$SPASS" "$M/conf" >"$M/pdw.conf"
+run -- --config "$M/pdw.conf"
+check "config key servers-file= works; host= is ignored with a warning" bash -c '[[ $1 -eq 0 ]] && [[ $(ls "$2"/*/*.dump | wc -l) -eq 5 ]] && grep -q "host=/port= in the config file are ignored" <<<"$3"' _ "$RC" "$M/conf" "$OUT"
+
+# Windows (Git Bash) simulation: CRLF servers file, Windows paths, CRLF tools
+mkdir -p "$DRIVES/c/Users/me/pg pass"
+cp "$SPASS" "$DRIVES/c/Users/me/pg pass/servers.pgpass"
+printf '# edited in Notepad\r\n127.0.0.1,%s,%s,abc\r\n127.0.0.1,%s,,all\r\n' "$PORT" "$PGUSER_T" "$PORT2" >"$DRIVES/c/conf/servers.txt"
+: >"$W/calls.log"
+run "${WENV[@]}" -- -U "$PGUSER_T" --min-free-mb 1 --pgpassfile 'C:\Users\me\pg pass\servers.pgpass' --pg-bin "$WINBIN_WIN" \
+    --servers 'C:\conf\servers.txt' -o 'C:\multi' --verify
+check "Windows: CRLF servers file + C:\\ paths exits 0" test "$RC" -eq 0
+check "Windows: each server in C:\\multi\\<host>_<port>" bash -c '[[ $(ls "$1"/$2/*.dump | wc -l) -eq 1 && $(ls "$1"/$3/*.dump | wc -l) -eq 3 ]]' _ "$DRIVES/c/multi" "$S1" "$S2"
+check "Windows: pg_dump.exe gets --file=C:/multi/<host>_<port>/..." grep -q -- "--file=C:/multi/$S2/hr_" "$W/calls.log"
+check "Windows: no CR in the servers log" bash -c "! grep -q \$'\\r' '$DRIVES/c/multi/pg_dump_wrapper.log'"
+
+# ----------------------------------------------------------------------------
 section "Static checks"
 if command -v shellcheck >/dev/null 2>&1; then
     OUT="$(shellcheck -e SC2329 "$WRAPPER" 2>&1)"; check "shellcheck clean" test -z "$OUT"
 fi
-OUT="$(bash "$WRAPPER" --version)"; check "--version" has "2.2.0"
+OUT="$(bash "$WRAPPER" --version)"; check "--version" has "2.3.0"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
